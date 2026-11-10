@@ -32,7 +32,7 @@ const env = {
   GMC_SERVICE_ACCOUNT_JSON: '{}'
 }
 
-const resultLines = () => mockLines.filter(l => String(l).startsWith('PRICE_SYNC_RESULT ')).map(l => JSON.parse(l.slice('PRICE_SYNC_RESULT '.length)))
+const linesWith = prefix => mockLines.filter(l => String(l).startsWith(prefix))
 
 const summary = {
   runId: 'r1',
@@ -78,7 +78,8 @@ describe('price-sync action', () => {
     const res = await main({ ...env, PRICE_SYNC_MODE: 'live' })
     expect(res.error.statusCode).toBe(503)
     expect(runPriceSync).not.toHaveBeenCalled()
-    expect(resultLines()).toEqual([{ env: 'test', status: 'failed', reason: 'database unavailable: 403 Forbidden' }])
+    expect(linesWith('PRICE_SYNC_RESULT')).toEqual(['PRICE_SYNC_RESULT env=test status=failed alerts=1'])
+    expect(linesWith('PRICE_SYNC_ALERT')).toEqual(['PRICE_SYNC_ALERT env=test run=none :: price-sync failed: database unavailable: 403 Forbidden'])
   })
 
   test('dry-run without a database falls back to an in-memory store', async () => {
@@ -88,7 +89,14 @@ describe('price-sync action', () => {
     expect(runPriceSync.mock.calls[0][0].store).toBeInstanceOf(MemoryPriceStore)
   })
 
-  test('live: passes config through, posts the digest, and closes the store', async () => {
+  test('an aborted pass logs single-token values plus one alert line per problem', async () => {
+    runPriceSync.mockResolvedValue({ ...summary, status: 'aborted', abortReason: 'zazzle after=0: HTTP 503 "busy"', pass: { ...summary.pass, complete: false } })
+    await main({ ...env, PRICE_SYNC_MODE: 'live' })
+    expect(linesWith('PRICE_SYNC_RESULT')[0]).toMatch(/^PRICE_SYNC_RESULT env=test status=aborted .* alerts=1$/)
+    expect(linesWith('PRICE_SYNC_ALERT')).toEqual(['PRICE_SYNC_ALERT env=test run=r1 :: Pass aborted: zazzle after=0: HTTP 503 "busy"'])
+  })
+
+  test('live: passes config through, logs the result line, and closes the store', async () => {
     const store = new MemoryPriceStore()
     store.close = jest.fn(async () => {})
     openPriceStore.mockResolvedValue(store)
@@ -106,7 +114,10 @@ describe('price-sync action', () => {
       expectedCurrency: 'USD',
       maxWrites: 50
     })
-    expect(resultLines()).toEqual([expect.objectContaining({ env: 'test', status: 'complete', runId: 'r1', written: 1, alerts: [] })])
+    expect(linesWith('PRICE_SYNC_RESULT')).toEqual([
+      'PRICE_SYNC_RESULT env=test status=complete mode=live run=r1 resumed=no durationMin=1.0 total=1 returned=1 new=1 changed=0 refresh=0 unchanged=0 written=1 notFound=0 failed=0 deleted=0 deleteCandidates=0 alerts=0'
+    ])
+    expect(linesWith('PRICE_SYNC_ALERT')).toEqual([])
     expect(store.close).toHaveBeenCalled()
   })
 })

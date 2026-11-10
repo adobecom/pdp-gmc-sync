@@ -189,11 +189,10 @@ resumes a pass that didn't finish, and is a no-op otherwise.
    longer returns. They are deleted only with `PRICE_SYNC_DELETES=enabled`,
    and never if `totalCount` fell >5% since the last complete pass or the list
    exceeds 5% of the catalog.
-6. Logs one `PRICE_SYNC_RESULT {json}` line per invocation (status, counts,
-   alerts) for log search to alert or report on, plus a readable digest and
-   the delete-candidate list. On problems (aborted/incomplete pass, failed
-   writes, offers failing 3+ days running, offers close to expiry) it also
-   logs to Lana when `LANA_CLIENT_ID` is set.
+6. Logs one `PRICE_SYNC_RESULT` line per invocation and one `PRICE_SYNC_ALERT`
+   line per problem (aborted or incomplete pass, failed writes, offers failing
+   3+ days running, offers close to expiry), plus a readable digest and the
+   delete-candidate list. See [Monitoring](#monitoring).
 
 `sync-products` re-inserts whole products, prices included, so after it
 writes it drops those offers' price-sync records; the next pass rewrites their
@@ -206,7 +205,6 @@ prices from `getbulkpricing`.
 | `PRICE_SYNC_MODE` | `off` (default), `dry-run`, `live` | `live` | `off` |
 | `PRICE_SYNC_DELETES` | `report` (default), `enabled` | `report` | `report` |
 | `PRICE_SYNC_SHIPPING` | `ignore` (default), `send` | `send` | `send` |
-| `LANA_CLIENT_ID` | Lana client id (optional) | secret | secret |
 
 With `PRICE_SYNC_SHIPPING=send`, each offer's `shipping` is written from
 Zazzle's list (empty list → cleared so account shipping settings apply; null
@@ -231,6 +229,53 @@ node scripts/price-sync-dry-run.js --pages 5
 ```
 `force` starts a new pass even if one already completed today. A pass stopped
 by `maxPages` is resumed by the next invocation.
+
+### Monitoring
+
+Each invocation logs, for example:
+```
+PRICE_SYNC_RESULT env=test status=complete mode=live run=2026-11-11T08:15:00.412Z-3fa2c1 resumed=no durationMin=31.2 total=52321 returned=52321 new=0 changed=118 refresh=7406 unchanged=44797 written=7524 notFound=0 knownMissing=0 failed=0 deleted=0 deleteCandidates=0 atRisk=0 repeatFailures=0 alerts=0
+PRICE_SYNC_ALERT env=test run=... :: Pass aborted: zazzle after=2560...: HTTP 503
+```
+`status` is `complete`, `incomplete` (finished but Zazzle skipped products,
+so no deletes), `aborted` (stopped on an error; the next trigger resumes it),
+`stopped` (manual `maxPages`), `skipped` (already ran today / locked) or
+`failed` (couldn't start).
+
+Where to look:
+- **Logs:** [Adobe Developer Console](https://developer.adobe.com/console) →
+  project → workspace → **App Builder Logs**; filter to `price-sync` and
+  search `PRICE_SYNC`. CLI: `aio app logs --action gmc-feed-sync/price-sync`.
+- **Action result** (full summary, kept 7 days):
+  `aio runtime activation list --limit 20` (find the `price-sync` rows),
+  then `aio runtime activation result <activationId>`.
+- **Database** (with `aio plugins install @adobe/aio-cli-plugin-app-storage`,
+  run from the repo root):
+  ```bash
+  aio app db document find price_sync_runs '{}' --sort '{"startedAt": -1}' --limit 5
+  aio app db document count price_sync_offers '{"notInGmc": true}'
+  aio app db document find price_sync_offers '{"failCount": {"$gte": 1}}' --sort '{"failCount": -1}'
+  ```
+
+Splunk (after log forwarding is set up for the workspace; `wcmsops_milo_np`
+is the shared non-prod index, `wcmsops_milo_prd` prod):
+```
+# problem alert: latest real run in the last 24h didn't complete cleanly
+index=wcmsops_milo_np "PRICE_SYNC_RESULT" earliest=-24h
+| rex "PRICE_SYNC_RESULT env=(?<env>\S+) status=(?<status>\S+)"
+| rex "alerts=(?<alerts>\d+)"
+| where status!="skipped"
+| stats latest(status) as status latest(alerts) as alerts latest(_time) as last_run by env
+| where status!="complete" OR alerts>0
+
+# missed-run alert: trigger when this returns 0 results
+index=wcmsops_milo_np "PRICE_SYNC_RESULT" "status=complete" earliest=-26h
+
+# alert details
+index=wcmsops_milo_np "PRICE_SYNC_ALERT" earliest=-24h
+| rex "PRICE_SYNC_ALERT env=(?<env>\S+) run=(?<run>\S+) :: (?<alert>[^\"\\]+)"
+| table _time env run alert
+```
 
 **Filling the test account.** Patches only reach offers that already exist,
 so to exercise the full catalog in the test account, copy production's
@@ -327,7 +372,6 @@ actions/
     priceStore.js                   # App Builder Database store (last-sent records, runs, lock)
     priceSync.js                    # pass orchestration: resume, writes, deletes, digest
     googleWrites.js                 # productInputs.patch/delete with backoff
-    lana.js                         # optional server-side Lana logging
 config/
   defaults.json                     # brand, availability, condition, currency, feedLabel, contentLanguage, pdpBaseUrl (TODO)
   category-map.json                 # product_type → googleProductCategory (empty by default)

@@ -13,7 +13,6 @@ const { resolveAccount, resolveDataSource } = require('../lib/config')
 const { fetchBulkPricingPage, DEFAULT_URL } = require('../lib/zazzleBulkPricing')
 const { openPriceStore, MemoryPriceStore } = require('../lib/priceStore')
 const { runPriceSync, formatPriceSyncDigest, alertsFor } = require('../lib/priceSync')
-const { lanaLog } = require('../lib/lana')
 const { redact } = require('../lib/redact')
 const { errorResponse } = require('../utils')
 const defaults = require('../../config/defaults.json')
@@ -39,63 +38,57 @@ function intParam (value, min, max) {
   return n
 }
 
-// One JSON line per run, prefixed so log search (Splunk) can alert and report
-// on it: e.g. status != "complete", alerts present, or no line for 26 hours.
+// Every invocation logs one PRICE_SYNC_RESULT line and one PRICE_SYNC_ALERT
+// line per problem, for Splunk searches and email alerts (see README). Values
+// are single tokens with no spaces or quotes, so plain text searches such as
+// "status=complete" and rex extractions work however the log forwarder wraps
+// the line.
 function resultLine (env, fields) {
-  return `PRICE_SYNC_RESULT ${JSON.stringify({ env, ...fields })}`
+  const pairs = Object.entries({ env, ...fields })
+    .filter(([, v]) => v !== undefined && v !== null)
+    .map(([k, v]) => `${k}=${String(v).replace(/[\s"\\]+/g, '_')}`)
+  return `PRICE_SYNC_RESULT ${pairs.join(' ')}`
+}
+
+function alertLine (env, runId, message) {
+  return `PRICE_SYNC_ALERT env=${env} run=${runId || 'none'} :: ${message}`
 }
 
 function summaryFields (summary) {
-  if (summary.skipped) return { status: 'skipped', reason: summary.reason, runId: summary.runId || null }
+  if (summary.skipped) return { status: 'skipped', reason: summary.reason, run: summary.runId }
   const c = summary.counters
   return {
     status: summary.status,
     mode: summary.mode,
-    runId: summary.runId,
-    resumed: summary.resumed,
-    reason: summary.abortReason,
-    durationMs: summary.durationMs,
-    totalCount: summary.pass.totalCount,
+    run: summary.runId,
+    resumed: summary.resumed ? 'yes' : 'no',
+    durationMin: (summary.durationMs / 60000).toFixed(1),
+    total: summary.pass.totalCount,
     returned: c.returned,
-    due: c.due,
+    new: c.due.new,
+    changed: c.due.changed,
+    refresh: c.due.refresh,
     unchanged: c.unchanged,
     written: c.written,
     notFound: c.notFound,
-    notInGmcSkipped: c.notInGmcSkipped,
+    knownMissing: c.notInGmcSkipped,
     failed: c.failed,
     deleted: c.deleted,
     deleteCandidates: summary.deletes.candidates,
-    deletesBlocked: summary.deletes.blockedReason || null,
-    atRisk: summary.health?.atRisk ?? null,
-    repeatFailures: summary.health?.repeatFailureCount ?? null,
-    alerts: alertsFor(summary)
+    atRisk: summary.health?.atRisk,
+    repeatFailures: summary.health?.repeatFailureCount,
+    alerts: alertsFor(summary).length
   }
 }
 
-async function notify (params, summary, logger) {
-  const env = params.GMC_ENV
-  const alerts = alertsFor(summary)
-  if (alerts.length) {
-    await lanaLog(`price-sync ${summary.status} env=${env} run=${summary.runId}: ${alerts.join(' | ')}`, {
-      clientId: params.LANA_CLIENT_ID,
-      env: env === 'prod' ? 'prod' : 'stage',
-      severity: summary.status === 'aborted' ? 'e' : 'w',
-      tags: 'pdp-gmc-sync,price-sync',
-      logger
-    })
-  }
+function logSummary (env, summary, logger) {
+  logger.info(resultLine(env, summaryFields(summary)))
+  for (const a of alertsFor(summary)) logger.warn(alertLine(env, summary.runId, a))
 }
 
-async function notifyFailure (params, message, logger) {
-  const env = params.GMC_ENV
-  logger.error(resultLine(env, { status: 'failed', reason: message }))
-  await lanaLog(`price-sync failed env=${env}: ${message}`, {
-    clientId: params.LANA_CLIENT_ID,
-    env: env === 'prod' ? 'prod' : 'stage',
-    severity: 'e',
-    tags: 'pdp-gmc-sync,price-sync',
-    logger
-  })
+function logFailure (params, message, logger) {
+  logger.error(resultLine(params.GMC_ENV, { status: 'failed', alerts: 1 }))
+  logger.error(alertLine(params.GMC_ENV, null, `price-sync failed: ${message}`))
 }
 
 function logDeleteList (summary, logger) {
@@ -130,7 +123,7 @@ async function main (params) {
     if (mode === 'live') ({ productInputs } = makeClients(params))
   } catch (e) {
     logger.error(`price-sync config/auth error: ${e.message}`)
-    await notifyFailure(params, 'server misconfigured (see activation logs)', logger)
+    logFailure(params, 'server misconfigured (see activation logs)', logger)
     return errorResponse(500, 'server misconfigured — see logs', logger)
   }
 
@@ -140,7 +133,7 @@ async function main (params) {
   } catch (e) {
     if (mode === 'live') {
       logger.error(`price-sync: database unavailable: ${e.message}`)
-      await notifyFailure(params, `database unavailable: ${e.message}`, logger)
+      logFailure(params, `database unavailable: ${e.message}`, logger)
       return errorResponse(503, 'database unavailable — see logs', logger)
     }
     logger.warn(`price-sync: database unavailable (${e.message}); dry run treats every product as new`)
@@ -176,15 +169,14 @@ async function main (params) {
       concurrency
     })
 
-    logger.info(resultLine(params.GMC_ENV, summaryFields(summary)))
+    logSummary(params.GMC_ENV, summary, logger)
     if (summary.skipped) return { statusCode: 200, body: summary }
     logger.info(formatPriceSyncDigest(summary, { env: params.GMC_ENV }))
     logDeleteList(summary, logger)
-    await notify(params, summary, logger)
     return { statusCode: 200, body: summary }
   } catch (e) {
     logger.error(`price-sync failed: ${e.stack || e.message}`)
-    await notifyFailure(params, e.message, logger)
+    logFailure(params, e.message, logger)
     return errorResponse(500, `price-sync failed: ${e.message}`, logger)
   } finally {
     try {
