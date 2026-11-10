@@ -189,9 +189,11 @@ resumes a pass that didn't finish, and is a no-op otherwise.
    longer returns. They are deleted only with `PRICE_SYNC_DELETES=enabled`,
    and never if `totalCount` fell >5% since the last complete pass or the list
    exceeds 5% of the catalog.
-6. Posts a digest to Slack, and on problems (aborted/incomplete pass, failed
-   writes, offers failing 3+ days running, offers close to expiry) logs to
-   Lana when `LANA_CLIENT_ID` is set.
+6. Logs one `PRICE_SYNC_RESULT {json}` line per invocation (status, counts,
+   alerts) for log search to alert or report on, plus a readable digest and
+   the delete-candidate list. On problems (aborted/incomplete pass, failed
+   writes, offers failing 3+ days running, offers close to expiry) it also
+   logs to Lana when `LANA_CLIENT_ID` is set.
 
 `sync-products` re-inserts whole products, prices included, so after it
 writes it drops those offers' price-sync records; the next pass rewrites their
@@ -203,7 +205,7 @@ prices from `getbulkpricing`.
 | --- | --- | --- | --- |
 | `PRICE_SYNC_MODE` | `off` (default), `dry-run`, `live` | `live` | `off` |
 | `PRICE_SYNC_DELETES` | `report` (default), `enabled` | `report` | `report` |
-| `PRICE_SYNC_SHIPPING` | `ignore` (default), `send` | `send` | `ignore` |
+| `PRICE_SYNC_SHIPPING` | `ignore` (default), `send` | `send` | `send` |
 | `LANA_CLIENT_ID` | Lana client id (optional) | secret | secret |
 
 With `PRICE_SYNC_SHIPPING=send`, each offer's `shipping` is written from
@@ -229,6 +231,16 @@ node scripts/price-sync-dry-run.js --pages 5
 ```
 `force` starts a new pass even if one already completed today. A pass stopped
 by `maxPages` is resumed by the next invocation.
+
+**Filling the test account.** Patches only reach offers that already exist,
+so to exercise the full catalog in the test account, copy production's
+products into the test data source first (reads production, writes only to a
+`GMC_ENV=test` account; dry run unless `--write`):
+```bash
+node scripts/seed-test-account.js                    # counts per data source, writes nothing
+node scripts/seed-test-account.js --write --limit 100
+node scripts/seed-test-account.js --write            # the rest; already-copied offers are skipped
+```
 
 ## Local dev
 

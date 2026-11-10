@@ -1,5 +1,13 @@
+const mockLines = []
 jest.mock('@adobe/aio-sdk', () => ({
-  Core: { Logger: () => ({ debug () {}, info () {}, warn () {}, error () {} }) }
+  Core: {
+    Logger: () => ({
+      debug () {},
+      info: m => mockLines.push(m),
+      warn: m => mockLines.push(m),
+      error: m => mockLines.push(m)
+    })
+  }
 }))
 jest.mock('../../actions/lib/gmcClients', () => ({
   makeClients: jest.fn(() => ({ productInputs: {} }))
@@ -12,20 +20,19 @@ jest.mock('../../actions/lib/priceSync', () => {
   const actual = jest.requireActual('../../actions/lib/priceSync')
   return { ...actual, runPriceSync: jest.fn() }
 })
-jest.mock('../../actions/lib/slack', () => ({ postSlack: jest.fn(async () => ({ ok: true })) }))
 
 const { openPriceStore, MemoryPriceStore } = require('../../actions/lib/priceStore')
 const { runPriceSync } = require('../../actions/lib/priceSync')
-const { postSlack } = require('../../actions/lib/slack')
 const { main, resolveMode } = require('../../actions/price-sync/index')
 
 const env = {
   GMC_ENV: 'test',
   GMC_MERCHANT_ACCOUNT_ID: '5830778204',
   GMC_DATASOURCE_ID: '10693230513',
-  GMC_SERVICE_ACCOUNT_JSON: '{}',
-  SLACK_WEBHOOK_URL: 'https://hooks.slack.example/x'
+  GMC_SERVICE_ACCOUNT_JSON: '{}'
 }
+
+const resultLines = () => mockLines.filter(l => String(l).startsWith('PRICE_SYNC_RESULT ')).map(l => JSON.parse(l.slice('PRICE_SYNC_RESULT '.length)))
 
 const summary = {
   runId: 'r1',
@@ -41,6 +48,7 @@ const summary = {
 
 beforeEach(() => {
   jest.clearAllMocks()
+  mockLines.length = 0
   openPriceStore.mockResolvedValue(new MemoryPriceStore())
   runPriceSync.mockResolvedValue(summary)
 })
@@ -70,7 +78,7 @@ describe('price-sync action', () => {
     const res = await main({ ...env, PRICE_SYNC_MODE: 'live' })
     expect(res.error.statusCode).toBe(503)
     expect(runPriceSync).not.toHaveBeenCalled()
-    expect(postSlack).toHaveBeenCalledWith(env.SLACK_WEBHOOK_URL, expect.stringContaining('database unavailable'))
+    expect(resultLines()).toEqual([{ env: 'test', status: 'failed', reason: 'database unavailable: 403 Forbidden' }])
   })
 
   test('dry-run without a database falls back to an in-memory store', async () => {
@@ -98,7 +106,7 @@ describe('price-sync action', () => {
       expectedCurrency: 'USD',
       maxWrites: 50
     })
-    expect(postSlack).toHaveBeenCalledWith(env.SLACK_WEBHOOK_URL, expect.stringContaining('status: *complete*'))
+    expect(resultLines()).toEqual([expect.objectContaining({ env: 'test', status: 'complete', runId: 'r1', written: 1, alerts: [] })])
     expect(store.close).toHaveBeenCalled()
   })
 })

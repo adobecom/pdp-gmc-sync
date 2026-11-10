@@ -474,11 +474,11 @@ function alertsFor (summary) {
 }
 
 function formatPriceSyncDigest (summary, { env } = {}) {
-  if (summary.skipped) return `*GMC price sync* — env: \`${env}\` — skipped (${summary.reason})`
+  if (summary.skipped) return `GMC price sync — env: ${env} — skipped (${summary.reason})`
   const c = summary.counters
   const minutes = (summary.durationMs / 60000).toFixed(1)
   const lines = [
-    `*GMC price sync* — env: \`${env}\` — mode: \`${summary.mode}\` — status: *${summary.status}*${summary.resumed ? ' (resumed)' : ''} — ${minutes} min`,
+    `GMC price sync — env: ${env} — mode: ${summary.mode} — status: ${summary.status}${summary.resumed ? ' (resumed)' : ''} — ${minutes} min`,
     `Zazzle: ${c.returned} products on ${c.pages} pages (totalCount ${summary.pass.totalCount}, excluded ${c.excluded}, skipped ${c.skippedByZazzle}, invalid ${c.invalid})`,
     `Due: ${c.due.new} new, ${c.due.changed} changed, ${c.due.refresh} refresh — unchanged ${c.unchanged}${c.cappedByMaxWrites ? ` — capped ${c.cappedByMaxWrites}` : ''}`,
     `Google: ${c.written} written, ${c.notFound} not in data source${c.notInGmcSkipped ? ` (+${c.notInGmcSkipped} known missing, rechecked weekly)` : ''}, ${c.failed} failed, ${c.deleted} deleted`,
@@ -486,7 +486,7 @@ function formatPriceSyncDigest (summary, { env } = {}) {
   ]
   const alerts = alertsFor(summary)
   if (alerts.length) {
-    lines.push('*Alerts:*')
+    lines.push('Alerts:')
     for (const a of alerts) lines.push(`• ${a}`)
   }
   return lines.join('\n')

@@ -13,7 +13,6 @@ const { resolveAccount, resolveDataSource } = require('../lib/config')
 const { fetchBulkPricingPage, DEFAULT_URL } = require('../lib/zazzleBulkPricing')
 const { openPriceStore, MemoryPriceStore } = require('../lib/priceStore')
 const { runPriceSync, formatPriceSyncDigest, alertsFor } = require('../lib/priceSync')
-const { postSlack } = require('../lib/slack')
 const { lanaLog } = require('../lib/lana')
 const { redact } = require('../lib/redact')
 const { errorResponse } = require('../utils')
@@ -40,14 +39,42 @@ function intParam (value, min, max) {
   return n
 }
 
+// One JSON line per run, prefixed so log search (Splunk) can alert and report
+// on it: e.g. status != "complete", alerts present, or no line for 26 hours.
+function resultLine (env, fields) {
+  return `PRICE_SYNC_RESULT ${JSON.stringify({ env, ...fields })}`
+}
+
+function summaryFields (summary) {
+  if (summary.skipped) return { status: 'skipped', reason: summary.reason, runId: summary.runId || null }
+  const c = summary.counters
+  return {
+    status: summary.status,
+    mode: summary.mode,
+    runId: summary.runId,
+    resumed: summary.resumed,
+    reason: summary.abortReason,
+    durationMs: summary.durationMs,
+    totalCount: summary.pass.totalCount,
+    returned: c.returned,
+    due: c.due,
+    unchanged: c.unchanged,
+    written: c.written,
+    notFound: c.notFound,
+    notInGmcSkipped: c.notInGmcSkipped,
+    failed: c.failed,
+    deleted: c.deleted,
+    deleteCandidates: summary.deletes.candidates,
+    deletesBlocked: summary.deletes.blockedReason || null,
+    atRisk: summary.health?.atRisk ?? null,
+    repeatFailures: summary.health?.repeatFailureCount ?? null,
+    alerts: alertsFor(summary)
+  }
+}
+
 async function notify (params, summary, logger) {
   const env = params.GMC_ENV
   const alerts = alertsFor(summary)
-  try {
-    await postSlack(params.SLACK_WEBHOOK_URL, formatPriceSyncDigest(summary, { env }))
-  } catch (e) {
-    logger.error(`price-sync: Slack post failed: ${e.message}`)
-  }
   if (alerts.length) {
     await lanaLog(`price-sync ${summary.status} env=${env} run=${summary.runId}: ${alerts.join(' | ')}`, {
       clientId: params.LANA_CLIENT_ID,
@@ -61,11 +88,7 @@ async function notify (params, summary, logger) {
 
 async function notifyFailure (params, message, logger) {
   const env = params.GMC_ENV
-  try {
-    await postSlack(params.SLACK_WEBHOOK_URL, `*GMC price sync* — env: \`${env}\` — *failed*: ${message}`)
-  } catch (e) {
-    logger.error(`price-sync: Slack post failed: ${e.message}`)
-  }
+  logger.error(resultLine(env, { status: 'failed', reason: message }))
   await lanaLog(`price-sync failed env=${env}: ${message}`, {
     clientId: params.LANA_CLIENT_ID,
     env: env === 'prod' ? 'prod' : 'stage',
@@ -153,10 +176,8 @@ async function main (params) {
       concurrency
     })
 
-    if (summary.skipped) {
-      logger.info(`price-sync skipped: ${summary.reason}${summary.runId ? ` (run ${summary.runId}, ${summary.status})` : ''}`)
-      return { statusCode: 200, body: summary }
-    }
+    logger.info(resultLine(params.GMC_ENV, summaryFields(summary)))
+    if (summary.skipped) return { statusCode: 200, body: summary }
     logger.info(formatPriceSyncDigest(summary, { env: params.GMC_ENV }))
     logDeleteList(summary, logger)
     await notify(params, summary, logger)

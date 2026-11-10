@@ -72,7 +72,7 @@ jobs:
           # ignore | send for writing Zazzle's per-offer shipping rates.
           PRICE_SYNC_MODE: 'off'
           PRICE_SYNC_DELETES: 'report'
-          PRICE_SYNC_SHIPPING: 'ignore'
+          PRICE_SYNC_SHIPPING: 'send'
         uses: adobe/aio-apps-action@4.1.0
         with:
           os: ${{ matrix.os }}
