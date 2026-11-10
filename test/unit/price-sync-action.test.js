@@ -1,0 +1,104 @@
+jest.mock('@adobe/aio-sdk', () => ({
+  Core: { Logger: () => ({ debug () {}, info () {}, warn () {}, error () {} }) }
+}))
+jest.mock('../../actions/lib/gmcClients', () => ({
+  makeClients: jest.fn(() => ({ productInputs: {} }))
+}))
+jest.mock('../../actions/lib/priceStore', () => {
+  const actual = jest.requireActual('../../actions/lib/priceStore')
+  return { ...actual, openPriceStore: jest.fn() }
+})
+jest.mock('../../actions/lib/priceSync', () => {
+  const actual = jest.requireActual('../../actions/lib/priceSync')
+  return { ...actual, runPriceSync: jest.fn() }
+})
+jest.mock('../../actions/lib/slack', () => ({ postSlack: jest.fn(async () => ({ ok: true })) }))
+
+const { openPriceStore, MemoryPriceStore } = require('../../actions/lib/priceStore')
+const { runPriceSync } = require('../../actions/lib/priceSync')
+const { postSlack } = require('../../actions/lib/slack')
+const { main, resolveMode } = require('../../actions/price-sync/index')
+
+const env = {
+  GMC_ENV: 'test',
+  GMC_MERCHANT_ACCOUNT_ID: '5830778204',
+  GMC_DATASOURCE_ID: '10693230513',
+  GMC_SERVICE_ACCOUNT_JSON: '{}',
+  SLACK_WEBHOOK_URL: 'https://hooks.slack.example/x'
+}
+
+const summary = {
+  runId: 'r1',
+  mode: 'live',
+  status: 'complete',
+  durationMs: 60000,
+  pass: { totalCount: 1, complete: true, incompleteReasons: [] },
+  counters: { pages: 1, returned: 1, excluded: 0, skippedByZazzle: 0, invalid: 0, unchanged: 0, due: { new: 1, changed: 0, refresh: 0 }, written: 1, notFound: 0, failed: 0, deleted: 0, deleteFailed: 0 },
+  deletes: { mode: 'report', candidates: 0, sample: [] },
+  deleteOfferIds: [],
+  health: null
+}
+
+beforeEach(() => {
+  jest.clearAllMocks()
+  openPriceStore.mockResolvedValue(new MemoryPriceStore())
+  runPriceSync.mockResolvedValue(summary)
+})
+
+describe('price-sync action', () => {
+  test('mode defaults to off; invocation params can downgrade live to dry-run but never enable writes', () => {
+    expect(resolveMode({})).toBe('off')
+    expect(resolveMode({ PRICE_SYNC_MODE: 'live', dryRun: 'true' })).toBe('dry-run')
+    expect(resolveMode({ PRICE_SYNC_MODE: 'off', dryRun: false })).toBe('off')
+    expect(() => resolveMode({ PRICE_SYNC_MODE: 'false' })).toThrow(/PRICE_SYNC_MODE/)
+  })
+
+  test('off: returns without touching Zazzle, Google or the database', async () => {
+    const res = await main({ ...env })
+    expect(res).toEqual({ statusCode: 200, body: { skipped: true, reason: 'PRICE_SYNC_MODE=off' } })
+    expect(openPriceStore).not.toHaveBeenCalled()
+    expect(runPriceSync).not.toHaveBeenCalled()
+  })
+
+  test('rejects malformed invocation params', async () => {
+    const res = await main({ ...env, PRICE_SYNC_MODE: 'live', maxPages: 'lots' })
+    expect(res.error.statusCode).toBe(400)
+  })
+
+  test('live without a database fails loudly instead of rewriting everything', async () => {
+    openPriceStore.mockRejectedValue(new Error('403 Forbidden'))
+    const res = await main({ ...env, PRICE_SYNC_MODE: 'live' })
+    expect(res.error.statusCode).toBe(503)
+    expect(runPriceSync).not.toHaveBeenCalled()
+    expect(postSlack).toHaveBeenCalledWith(env.SLACK_WEBHOOK_URL, expect.stringContaining('database unavailable'))
+  })
+
+  test('dry-run without a database falls back to an in-memory store', async () => {
+    openPriceStore.mockRejectedValue(new Error('403 Forbidden'))
+    const res = await main({ ...env, PRICE_SYNC_MODE: 'dry-run' })
+    expect(res.statusCode).toBe(200)
+    expect(runPriceSync.mock.calls[0][0].store).toBeInstanceOf(MemoryPriceStore)
+  })
+
+  test('live: passes config through, posts the digest, and closes the store', async () => {
+    const store = new MemoryPriceStore()
+    store.close = jest.fn(async () => {})
+    openPriceStore.mockResolvedValue(store)
+    const res = await main({ ...env, PRICE_SYNC_MODE: 'live', PRICE_SYNC_DELETES: 'enabled', maxWrites: '50' })
+    expect(res.statusCode).toBe(200)
+    const [deps, opts] = runPriceSync.mock.calls[0]
+    expect(deps.productInputs).toBeDefined()
+    expect(opts).toMatchObject({
+      mode: 'live',
+      deletes: 'enabled',
+      accountId: '5830778204',
+      dataSource: 'accounts/5830778204/dataSources/10693230513',
+      contentLanguage: 'en',
+      feedLabel: 'US',
+      expectedCurrency: 'USD',
+      maxWrites: 50
+    })
+    expect(postSlack).toHaveBeenCalledWith(env.SLACK_WEBHOOK_URL, expect.stringContaining('status: *complete*'))
+    expect(store.close).toHaveBeenCalled()
+  })
+})

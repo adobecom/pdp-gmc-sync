@@ -1,0 +1,106 @@
+const { DbPriceStore, invalidatePriceRecords, OFFERS, RUNS, LOCKS } = require('../../actions/lib/priceStore')
+
+function fakeClient () {
+  const collections = {}
+  const make = () => ({
+    find: jest.fn(() => ({ toArray: async () => [] })),
+    bulkWrite: jest.fn(async () => ({})),
+    deleteMany: jest.fn(async () => ({})),
+    countDocuments: jest.fn(async () => 0),
+    insertOne: jest.fn(async () => ({})),
+    updateOne: jest.fn(async () => ({})),
+    deleteOne: jest.fn(async () => ({})),
+    findOne: jest.fn(async () => null)
+  })
+  return {
+    collections,
+    collection: jest.fn(name => (collections[name] ||= make())),
+    close: jest.fn(async () => {})
+  }
+}
+
+const NOW = new Date('2026-11-10T08:15:00Z')
+
+describe('DbPriceStore', () => {
+  test('applyResults sends one unordered bulkWrite per page, upserting only what it should', async () => {
+    const client = fakeClient()
+    const store = new DbPriceStore(client)
+    const state = { currency: 'USD', priceMicros: '1', salePriceMicros: null, saleStart: null, saleEnd: null, availability: 'IN_STOCK', discontinued: false }
+    await store.applyResults('run-1', NOW, [
+      { offerId: 'a', templateId: 'ta', outcome: 'written', state, fingerprint: 'fp' },
+      { offerId: 'b', outcome: 'unchanged' },
+      { offerId: 'c', templateId: 'tc', outcome: 'failed', error: 'INTERNAL: boom' },
+      { offerId: 'd', templateId: 'td', outcome: 'notFound', firstNotFound: true },
+      { offerId: 'e', outcome: 'deleted' }
+    ])
+    const offers = client.collections[OFFERS]
+    const [[ops, opts]] = offers.bulkWrite.mock.calls
+    expect(opts).toEqual({ ordered: false })
+    const byId = Object.fromEntries(ops.map(o => [o.updateOne.filter._id, o.updateOne]))
+    expect(byId.a).toMatchObject({ upsert: true, update: { $set: { sent: { ...state, fingerprint: 'fp' }, sentAt: NOW, lastSeenRunId: 'run-1', failCount: 0 } } })
+    expect(byId.b).toEqual({ filter: { _id: 'b' }, update: { $set: { lastSeenRunId: 'run-1', lastSeenAt: NOW } }, upsert: false })
+    expect(byId.c).toMatchObject({ upsert: true, update: { $inc: { failCount: 1 }, $set: { lastError: 'INTERNAL: boom' } } })
+    expect(byId.d).toMatchObject({ upsert: true, update: { $set: { notInGmc: true, notInGmcSince: NOW }, $unset: { sent: '', sentAt: '' } } })
+    expect(byId.e).toBeUndefined()
+    expect(offers.deleteMany).toHaveBeenCalledWith({ _id: { $in: ['e'] } })
+  })
+
+  test('delete candidates are offers we have sent that this run has not seen', async () => {
+    const client = fakeClient()
+    const store = new DbPriceStore(client)
+    const offers = client.collection(OFFERS)
+    offers.countDocuments.mockResolvedValue(2)
+    offers.find.mockReturnValue({ toArray: async () => [{ _id: 'x' }, { _id: 'y' }] })
+    expect(await store.findUnseenManaged('run-9', 100)).toEqual({ total: 2, offerIds: ['x', 'y'] })
+    expect(offers.find).toHaveBeenCalledWith({ sentAt: { $ne: null }, lastSeenRunId: { $ne: 'run-9' } }, { projection: { _id: 1 }, limit: 100 })
+  })
+
+  test('lock: acquired when inserted or taken over, refused when someone else holds it', async () => {
+    const client = fakeClient()
+    const store = new DbPriceStore(client)
+    const locks = client.collection(LOCKS)
+    locks.findOne.mockResolvedValueOnce({ holder: 'me' })
+    expect(await store.acquireLock('me', NOW, 1000)).toBe(true)
+
+    locks.insertOne.mockRejectedValueOnce(new Error('E11000 duplicate key'))
+    locks.findOne.mockResolvedValueOnce({ holder: 'other' })
+    expect(await store.acquireLock('me', NOW, 1000)).toBe(false)
+    expect(locks.updateOne).toHaveBeenLastCalledWith({ _id: 'price-sync', heldUntil: { $lt: NOW } }, { $set: { holder: 'me', heldUntil: new Date(NOW.getTime() + 1000) } })
+  })
+
+  test('latest run lookups sort by startedAt', async () => {
+    const client = fakeClient()
+    const store = new DbPriceStore(client)
+    const runs = client.collection(RUNS)
+    runs.find.mockReturnValue({ toArray: async () => [{ _id: 'r1', status: 'complete' }] })
+    expect(await store.getLastCompleteRun()).toEqual({ _id: 'r1', status: 'complete' })
+    expect(runs.find).toHaveBeenCalledWith({ status: 'complete' }, { sort: { startedAt: -1 }, limit: 1 })
+  })
+})
+
+describe('invalidatePriceRecords', () => {
+  const params = { __ims_oauth_s2s: { client_id: 'x' } }
+
+  test('skipped without include-ims-credentials or offers', async () => {
+    const open = jest.fn()
+    expect(await invalidatePriceRecords({}, ['a'], null, { open })).toEqual({ skipped: true })
+    expect(await invalidatePriceRecords(params, [], null, { open })).toEqual({ skipped: true })
+    expect(open).not.toHaveBeenCalled()
+  })
+
+  test('drops the records and closes the connection', async () => {
+    const store = { invalidateOffers: jest.fn(async () => {}), close: jest.fn(async () => {}) }
+    expect(await invalidatePriceRecords(params, ['a', 'b'], null, { open: async () => store })).toEqual({ ok: true })
+    expect(store.invalidateOffers).toHaveBeenCalledWith(['a', 'b'])
+    expect(store.close).toHaveBeenCalled()
+  })
+
+  test('never throws: failures and timeouts are logged and reported', async () => {
+    const logger = { error: jest.fn() }
+    const failing = await invalidatePriceRecords(params, ['a'], logger, { open: async () => { throw new Error('no db') } })
+    expect(failing).toEqual({ ok: false, error: 'no db' })
+    const slow = await invalidatePriceRecords(params, ['a'], logger, { timeoutMs: 10, open: () => new Promise(() => {}) })
+    expect(slow).toEqual({ ok: false, error: 'timed out after 10ms' })
+    expect(logger.error).toHaveBeenCalledTimes(2)
+  })
+})

@@ -6,6 +6,7 @@ const { validateRows, MAX_CHUNK } = require("../lib/validate");
 const { insertWithRetry } = require("../lib/insertWithRetry");
 const { runPool } = require("../lib/concurrency");
 const { initState, recordPushes } = require("../lib/syncState");
+const { invalidatePriceRecords } = require("../lib/priceStore");
 const { isValidImsToken } = require("../lib/imsAuth");
 const { redact } = require("../lib/redact");
 const { errorResponse, checkMissingRequestInputs } = require("../utils");
@@ -112,6 +113,7 @@ async function main(params) {
 
     const state = await statePromise;
     await recordPushes(state, params.GMC_ENV, accountId, pushedIds, logger);
+    await invalidatePriceRecords(params, pushedIds, logger);
 
     const body = {
         env: params.GMC_ENV,
