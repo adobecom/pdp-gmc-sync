@@ -28,17 +28,29 @@ const defaults = require('../config/defaults.json')
 const BATCH_SIZE = 500
 const FAILURE_SAMPLE_LIMIT = 20
 
-function parseEnvFile (file) {
-  const content = fs.readFileSync(path.resolve(process.cwd(), file), 'utf-8')
+// Accepts the .env forms dotenv does for single-line values: `export KEY=v`,
+// values wrapped in matching quotes, and ` # comments` after unquoted values.
+function parseEnvContent (content) {
   const env = {}
-  for (const line of content.split('\n')) {
-    const t = line.trim()
+  for (const line of content.split(/\r?\n/)) {
+    const t = line.trim().replace(/^export\s+/, '')
     if (!t || t.startsWith('#')) continue
     const i = t.indexOf('=')
     if (i === -1) continue
-    env[t.slice(0, i).trim()] = t.slice(i + 1).trim()
+    let value = t.slice(i + 1).trim()
+    const quote = value[0]
+    if ((quote === '"' || quote === "'") && value.lastIndexOf(quote) > 0) {
+      value = value.slice(1, value.lastIndexOf(quote))
+    } else {
+      value = value.replace(/\s+#.*$/, '')
+    }
+    env[t.slice(0, i).trim()] = value
   }
   return env
+}
+
+function parseEnvFile (file) {
+  return parseEnvContent(fs.readFileSync(path.resolve(process.cwd(), file), 'utf-8'))
 }
 
 function parseArgs (argv) {
@@ -206,4 +218,4 @@ if (require.main === module) {
   })
 }
 
-module.exports = { parseArgs, resolveTargets, toProductInput, seed, report }
+module.exports = { parseArgs, parseEnvContent, resolveTargets, toProductInput, seed, report }

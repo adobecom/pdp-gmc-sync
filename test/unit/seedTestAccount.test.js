@@ -1,4 +1,4 @@
-const { parseArgs, resolveTargets, toProductInput, seed, report } = require('../../scripts/seed-test-account')
+const { parseArgs, parseEnvContent, resolveTargets, toProductInput, seed, report } = require('../../scripts/seed-test-account')
 
 const prodEnv = { GMC_ENV: 'prod', GMC_MERCHANT_ACCOUNT_ID: '111', GMC_DATASOURCE_ID: '900' }
 const testEnv = { GMC_ENV: 'test', GMC_MERCHANT_ACCOUNT_ID: '222', GMC_DATASOURCE_ID: '800' }
@@ -26,6 +26,20 @@ describe('seed-test-account', () => {
     expect(parseArgs([])).toMatchObject({ sourceEnv: '.env.prod', targetEnv: '.env.stage', write: false, concurrency: 10, limit: null })
     expect(parseArgs(['--write', '--limit', '5', '--source-datasource', 'accounts/1/dataSources/9'])).toMatchObject({ write: true, limit: 5, sourceDataSource: '9' })
     expect(() => parseArgs(['--bogus'])).toThrow(/unknown argument/)
+  })
+
+  test('reads .env files the way dotenv does: quotes, inline comments, export', () => {
+    const json = '{"type":"service_account","private_key":"-----BEGIN PRIVATE KEY-----\\nAB#C\\n-----END PRIVATE KEY-----\\n"}'
+    const env = parseEnvContent([
+      '# comment',
+      'GMC_ENV=prod                    # test in .env.stage',
+      `GMC_SERVICE_ACCOUNT_JSON='${json}'`,
+      'export GMC_MERCHANT_ACCOUNT_ID="111"',
+      `RAW=${json}`,
+      'GMC_DATASOURCE_ID=900\r'
+    ].join('\n'))
+    expect(env).toEqual({ GMC_ENV: 'prod', GMC_SERVICE_ACCOUNT_JSON: json, GMC_MERCHANT_ACCOUNT_ID: '111', RAW: json, GMC_DATASOURCE_ID: '900' })
+    expect(JSON.parse(env.GMC_SERVICE_ACCOUNT_JSON).type).toBe('service_account')
   })
 
   test('only ever writes to a GMC_ENV=test account that differs from the source', () => {
