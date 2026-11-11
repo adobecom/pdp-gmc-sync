@@ -89,7 +89,7 @@ describe('sync-products action', () => {
     const res = await action.main({ ...validEnv, products: [goodRow] })
     expect(res.error?.statusCode).toBe(401)
     expect(res.error.body.error).toBe('invalid IMS token')
-    expect(mockValidateTokenAllowList).toHaveBeenCalledWith('stub', ['<da.live client_id>'])
+    expect(mockValidateTokenAllowList).toHaveBeenCalledWith('stub', ['<da.live client_id>', 'projectx_webapp', 'darkalley'])
     expect(makeClients).not.toHaveBeenCalled()
   })
 
