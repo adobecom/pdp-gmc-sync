@@ -249,8 +249,8 @@ Where to look:
 - **Action result** (full summary, kept 7 days):
   `aio runtime activation list --limit 20` (find the `price-sync` rows),
   then `aio runtime activation result <activationId>`.
-- **Database** (with `aio plugins install @adobe/aio-cli-plugin-app-storage`,
-  run from the repo root):
+- **Database** (`aio app db` ships with aio CLI 11+; run from the repo root
+  after `aio login` and `aio app use <workspace json>`):
   ```bash
   aio app db document find price_sync_runs '{}' --sort '{"startedAt": -1}' --limit 5
   aio app db document count price_sync_offers '{"notInGmc": true}'
