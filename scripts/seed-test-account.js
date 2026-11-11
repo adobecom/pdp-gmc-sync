@@ -26,6 +26,9 @@ const { callWithRetry } = require('../actions/lib/googleWrites')
 const defaults = require('../config/defaults.json')
 
 const BATCH_SIZE = 500
+// Async iteration pages on its own; leaving autoPaginate at its default only
+// triggers google-gax's AutopaginateTrueWarning.
+const LIST_OPTIONS = { autoPaginate: false }
 const FAILURE_SAMPLE_LIMIT = 20
 
 // Accepts the .env forms dotenv does for single-line values: `export KEY=v`,
@@ -98,7 +101,7 @@ const dataSourceId = name => String(name || '').split('/').pop() || '(none)'
 
 async function listOfferIds (productsClient, accountId) {
   const ids = new Set()
-  for await (const p of productsClient.listProductsAsync({ parent: `accounts/${accountId}`, pageSize: 1000 })) ids.add(p.offerId)
+  for await (const p of productsClient.listProductsAsync({ parent: `accounts/${accountId}`, pageSize: 1000 }, LIST_OPTIONS)) ids.add(p.offerId)
   return ids
 }
 
@@ -143,7 +146,7 @@ async function seed ({ productsClient, sourceProductsClient = productsClient, pr
     log(`inserted ${stats.inserted}, failed ${stats.failed}`)
   }
 
-  for await (const product of sourceProductsClient.listProductsAsync({ parent: `accounts/${source.accountId}`, pageSize: 1000 })) {
+  for await (const product of sourceProductsClient.listProductsAsync({ parent: `accounts/${source.accountId}`, pageSize: 1000 }, LIST_OPTIONS)) {
     stats.listed++
     const ds = dataSourceId(product.dataSource)
     stats.byDataSource[ds] = (stats.byDataSource[ds] || 0) + 1
