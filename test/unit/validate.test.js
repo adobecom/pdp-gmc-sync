@@ -145,7 +145,7 @@ describe('validateRows', () => {
 })
 
 describe('MAX_CHUNK', () => {
-  test('is lowered to 50 to respect the Adobe I/O Runtime 1MB payload limit', () => {
-    expect(MAX_CHUNK).toBe(50)
+  test('is 100, sized to stay well under the 60s blocking web-action timeout', () => {
+    expect(MAX_CHUNK).toBe(100)
   })
 })

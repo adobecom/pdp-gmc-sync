@@ -15,6 +15,7 @@ Sections **§4 (corrections)** and **§15 (security)** are non-negotiable.
 | `sync-products` | web (`require-adobe-auth: true`) | Map export rows → v1 `productInputs.insert` via a bounded concurrent pool. Retry-once on 5xx/429. Returns per-item results — one failure never aborts the batch. |
 | `diagnostics` | web (`require-adobe-auth: true`) | Returns detailed `product_view` status and item issues for processed products owned by the configured data source. Optional `offerIds` narrows the report. Posts a digest to Slack + log. |
 | `bootstrap-datasource` | admin (`web: no`) | One-off per environment. Creates a primary API data source and prints its ID. Store the ID in `.env` as `GMC_DATASOURCE_ID_{TEST\|PROD}`. |
+| `price-sync` | scheduled (`web: no`) | Daily pass over Zazzle's `getbulkpricing`; patches changed price / sale / availability (and optionally shipping) onto existing offers. See [Daily price sync](#daily-price-sync-price-sync). |
 
 Package name in the manifest: `gmc-feed-sync`. Runtime: `nodejs:22`. All web
 actions are marked `final: true` so injected secrets cannot be overridden by
@@ -154,6 +155,138 @@ New or updated inputs can take several minutes to become processed products, so
 they might initially appear in `missingOfferIds` or be absent from a full-source
 report.
 
+## Daily price sync (`price-sync`)
+
+Keeps Merchant Center prices in step with what the PDPs show, using Zazzle's
+bulk pricing endpoint (`getbulkpricing`, 100 products per call, ~520 calls per
+pass). DA documents are not touched: they carry no prices, and the PDP reads
+prices live from Zazzle.
+
+**Schedule.** An alarm trigger fires at 08:15 and 10:15 UTC
+(`price-sync-daily` in `app.config.yaml`). 08:15 runs the pass; 10:15 only
+resumes a pass that didn't finish, and is a no-op otherwise.
+
+**What a pass does.**
+1. Pages through `getbulkpricing`. A failing call is retried on the same
+   `after`; if it keeps failing (or Zazzle rate-limits us) the pass stops,
+   deletes nothing, and saves its cursor so the next invocation resumes there.
+2. Maps each product (Zazzle's rules): `price`/`salePrice` are totals for
+   `minQuantity` items and are sent as-is; the sale window comes from
+   `discountStart`/`discountEnd`; out of stock or discontinued → `OUT_OF_STOCK`.
+3. Compares it with what this job last sent (App Builder Database, keyed by
+   offerId). Only new, changed, or refresh-due offers are written. Refreshes
+   are spread over days 20–26 after the last write so offers never reach
+   Google's 30-day expiry.
+4. Writes with `productInputs.patch` on the primary data source, naming
+   price, sale price, sale window and availability in `updateMask` every time
+   (a masked field missing from the body is cleared, which is how an ended
+   sale is removed). Offers that aren't in the data source come back
+   `NOT_FOUND` and are reported, not created: new PDPs are added through the
+   DA tool. Known-missing offers are rechecked weekly (or with
+   `-p retryNotFound true`), not daily.
+5. After a **complete** pass (all calls succeeded, every `skippedCount` 0,
+   returned + excluded = the first `totalCount`), lists offers Zazzle no
+   longer returns. They are deleted only with `PRICE_SYNC_DELETES=enabled`,
+   and never if `totalCount` fell >5% since the last complete pass or the list
+   exceeds 5% of the catalog.
+6. Logs one `PRICE_SYNC_RESULT` line per invocation and one `PRICE_SYNC_ALERT`
+   line per problem (aborted or incomplete pass, failed writes, offers failing
+   3+ days running, offers close to expiry), plus a readable digest and the
+   delete-candidate list. See [Monitoring](#monitoring).
+
+`sync-products` re-inserts whole products, prices included, so after it
+writes it drops those offers' price-sync records; the next pass rewrites their
+prices from `getbulkpricing`.
+
+**Configuration (deploy-time, `final`).**
+
+| Input | Values | Stage | Prod |
+| --- | --- | --- | --- |
+| `PRICE_SYNC_MODE` | `off` (default), `dry-run`, `live` | `live` | `off` |
+| `PRICE_SYNC_DELETES` | `report` (default), `enabled` | `report` | `report` |
+| `PRICE_SYNC_SHIPPING` | `ignore` (default), `send` | `send` | `send` |
+
+With `PRICE_SYNC_SHIPPING=send`, each offer's `shipping` is written from
+Zazzle's list (empty list → cleared so account shipping settings apply; null
+→ left unchanged).
+
+**Database setup (once per workspace).** Add the **App Builder Data
+Services** API to the Stage and Production workspaces in Adobe Developer
+Console, then update the `SCOPES` GitHub environment secret to the
+credential's new scope list. The next `aio app deploy` provisions the
+database (`database.auto-provision` in `app.config.yaml`, region `amer`).
+`price-sync` and `sync-products` get their database token through the
+`include-ims-credentials` annotation.
+
+**Manual runs** (namespace credentials required):
+```bash
+# read-only: read + diff, no Google writes
+aio runtime action invoke gmc-feed-sync/price-sync -p dryRun true -p maxPages 3 --result
+# limited live run (test account), e.g. the first 50 writes
+aio runtime action invoke gmc-feed-sync/price-sync -p force true -p maxWrites 50 --result
+# rehearse against live Zazzle from your machine (no credentials, writes nothing)
+node scripts/price-sync-dry-run.js --pages 5
+```
+`force` starts a new pass even if one already completed today. A pass stopped
+by `maxPages` is resumed by the next invocation.
+
+### Monitoring
+
+Each invocation logs, for example:
+```
+PRICE_SYNC_RESULT env=test status=complete mode=live run=2026-11-11T08:15:00.412Z-3fa2c1 resumed=no durationMin=31.2 total=52321 returned=52321 new=0 changed=118 refresh=7406 unchanged=44797 written=7524 notFound=0 knownMissing=0 failed=0 deleted=0 deleteCandidates=0 atRisk=0 repeatFailures=0 alerts=0
+PRICE_SYNC_ALERT env=test run=... :: Pass aborted: zazzle after=2560...: HTTP 503
+```
+`status` is `complete`, `incomplete` (finished but Zazzle skipped products,
+so no deletes), `aborted` (stopped on an error; the next trigger resumes it),
+`stopped` (manual `maxPages`), `skipped` (already ran today / locked) or
+`failed` (couldn't start).
+
+Where to look:
+- **Logs:** [Adobe Developer Console](https://developer.adobe.com/console) →
+  project → workspace → **App Builder Logs**; filter to `price-sync` and
+  search `PRICE_SYNC`. CLI: `aio app logs --action gmc-feed-sync/price-sync`.
+- **Action result** (full summary, kept 7 days):
+  `aio runtime activation list --limit 20` (find the `price-sync` rows),
+  then `aio runtime activation result <activationId>`.
+- **Database** (`aio app db` ships with aio CLI 11+; run from the repo root
+  after `aio login` and `aio app use <workspace json>`):
+  ```bash
+  aio app db document find price_sync_runs '{}' --sort '{"startedAt": -1}' --limit 5
+  aio app db document count price_sync_offers '{"notInGmc": true}'
+  aio app db document find price_sync_offers '{"failCount": {"$gte": 1}}' --sort '{"failCount": -1}'
+  ```
+
+Splunk (after log forwarding is set up for the workspace; `wcmsops_milo_np`
+is the shared non-prod index, `wcmsops_milo_prd` prod):
+```
+# problem alert: latest real run in the last 24h didn't complete cleanly
+index=wcmsops_milo_np "PRICE_SYNC_RESULT" earliest=-24h
+| rex "PRICE_SYNC_RESULT env=(?<env>\S+) status=(?<status>\S+)"
+| rex "alerts=(?<alerts>\d+)"
+| where status!="skipped"
+| stats latest(status) as status latest(alerts) as alerts latest(_time) as last_run by env
+| where status!="complete" OR alerts>0
+
+# missed-run alert: trigger when this returns 0 results
+index=wcmsops_milo_np "PRICE_SYNC_RESULT" "status=complete" earliest=-26h
+
+# alert details
+index=wcmsops_milo_np "PRICE_SYNC_ALERT" earliest=-24h
+| rex "PRICE_SYNC_ALERT env=(?<env>\S+) run=(?<run>\S+) :: (?<alert>[^\"\\]+)"
+| table _time env run alert
+```
+
+**Filling the test account.** Patches only reach offers that already exist,
+so to exercise the full catalog in the test account, copy production's
+products into the test data source first (reads production, writes only to a
+`GMC_ENV=test` account; dry run unless `--write`):
+```bash
+node scripts/seed-test-account.js                    # counts per data source, writes nothing
+node scripts/seed-test-account.js --write --limit 100
+node scripts/seed-test-account.js --write            # the rest; already-copied offers are skipped
+```
+
 ## Local dev
 
 - `aio app run` — local dev server; actions still deployed to Runtime.
@@ -184,8 +317,10 @@ Deploys and pushes are performed by the repo owner — not by this tooling.
   npm test
   ```
   Covers `toMicros`, `mapProduct`, `validate`, `parseGoogleError`, `redact`,
-  `runPool`, `insertWithRetry`, `resolveAccount/DataSource`, and the
-  `sync-products` action's guards + happy path (Google clients mocked).
+  `runPool`, `insertWithRetry`, `resolveAccount/DataSource`, the
+  `sync-products` action's guards + happy path (Google clients mocked), and
+  the price sync: Zazzle client, mapping (including a Merchant API proto
+  round-trip), Database store, and full passes against fakes.
 - **Integration tests (real Merchant API, test account only):** gated on
   `GMC_RUN_INTEGRATION=1`; see [`test/integration/README.md`](./test/integration/README.md).
   Skipped under `npm test`. Never point them at prod.
@@ -217,6 +352,7 @@ actions/
   sync-products/index.js
   diagnostics/index.js
   bootstrap-datasource/index.js
+  price-sync/index.js               # scheduled daily Zazzle → GMC price pass
   utils.js                          # scaffold helpers (errorResponse, checkMissingRequestInputs, ...)
   lib/
     auth.js                         # validates service-account JSON and constructs GoogleAuth
@@ -231,6 +367,11 @@ actions/
     imsAuth.js                      # validates incoming bearer tokens with Adobe IMS
     slack.js                        # digest POST to webhook (HTTPS-only)
     redact.js                       # log-safe stringifier
+    zazzleBulkPricing.js            # getbulkpricing client (validation, retry same `after`)
+    priceMapping.js                 # Zazzle product → price state, diffing, patch requests
+    priceStore.js                   # App Builder Database store (last-sent records, runs, lock)
+    priceSync.js                    # pass orchestration: resume, writes, deletes, digest
+    googleWrites.js                 # productInputs.patch/delete with backoff
 config/
   defaults.json                     # brand, availability, condition, currency, feedLabel, contentLanguage, pdpBaseUrl (TODO)
   category-map.json                 # product_type → googleProductCategory (empty by default)

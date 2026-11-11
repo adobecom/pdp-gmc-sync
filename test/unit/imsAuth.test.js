@@ -34,7 +34,7 @@ describe('IMS authentication diagnostics', () => {
     expect(valid).toBe(true)
     expect(mockDecodeImsToken).toHaveBeenCalledWith(token)
     expect(mockValidateToken).toHaveBeenCalledWith(token)
-    expect(mockValidateTokenAllowList).toHaveBeenCalledWith(token, ['<da.live client_id>'])
+    expect(mockValidateTokenAllowList).toHaveBeenCalledWith(token, ['<da.live client_id>', 'projectx_webapp', 'darkalley'])
 
     const output = log.mock.calls.flat().join(' ')
     expect(output).toContain('"as":"ims-na1"')

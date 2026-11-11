@@ -26,7 +26,12 @@ jest.mock('../../actions/lib/gmcClients', () => ({
   })
 }))
 
+jest.mock('../../actions/lib/priceStore', () => ({
+  invalidatePriceRecords: jest.fn(async () => ({ ok: true }))
+}))
+
 const { makeClients } = require('../../actions/lib/gmcClients')
+const { invalidatePriceRecords } = require('../../actions/lib/priceStore')
 const action = require('../../actions/sync-products/index')
 
 const validEnv = {
@@ -84,7 +89,7 @@ describe('sync-products action', () => {
     const res = await action.main({ ...validEnv, products: [goodRow] })
     expect(res.error?.statusCode).toBe(401)
     expect(res.error.body.error).toBe('invalid IMS token')
-    expect(mockValidateTokenAllowList).toHaveBeenCalledWith('stub', ['<da.live client_id>'])
+    expect(mockValidateTokenAllowList).toHaveBeenCalledWith('stub', ['<da.live client_id>', 'projectx_webapp', 'darkalley'])
     expect(makeClients).not.toHaveBeenCalled()
   })
 
@@ -121,6 +126,13 @@ describe('sync-products action', () => {
     expect(res.body.failed).toBe(0)
     expect(res.body.pushedIds).toEqual(['zaz-1', 'zaz-2'])
     expect(res.body.failedItems).toEqual([])
+  })
+
+  test('drops price-sync records for re-inserted offers so the next price pass rewrites them', async () => {
+    invalidatePriceRecords.mockClear()
+    const products = [goodRow, { ...goodRow, product_id: '' }]
+    await action.main({ ...validEnv, products })
+    expect(invalidatePriceRecords).toHaveBeenCalledWith(expect.objectContaining({ GMC_ENV: 'test' }), ['zaz-1'], expect.anything())
   })
 
   test('validation failures appear in failedItems, do not abort the batch, and still return 200', async () => {

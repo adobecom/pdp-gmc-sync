@@ -159,12 +159,12 @@ describe('diagnostics action IMS authorization', () => {
     expect(res.body.requestedOfferCount).toBe(50)
   })
 
-  test('rejects more than 50 offerIds without querying Google', async () => {
-    const offerIds = Array.from({ length: 51 }, (_, index) => `offer-${index}`)
+  test('rejects more than 100 offerIds without querying Google', async () => {
+    const offerIds = Array.from({ length: 101 }, (_, index) => `offer-${index}`)
     const res = await action.main({ ...validParams, offerIds })
 
     expect(res.error?.statusCode).toBe(400)
-    expect(res.error.body.error).toContain('keep <= 50')
+    expect(res.error.body.error).toContain('keep <= 100')
     expect(mockSearchProductDiagnostics).not.toHaveBeenCalled()
   })
 

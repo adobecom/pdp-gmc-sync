@@ -20,6 +20,7 @@ application:
               GMC_ENV: $GMC_ENV
             annotations:
               require-adobe-auth: false
+              include-ims-credentials: true
               final: true
             limits:
               timeout: 60000
@@ -65,3 +66,50 @@ application:
               timeout: 60000
               memorySize: 512
               concurrency: 1
+
+          price-sync:
+            function: actions/price-sync/index.js
+            web: 'no'
+            runtime: nodejs:22
+            inputs:
+              LOG_LEVEL: $LOG_LEVEL
+              GMC_SERVICE_ACCOUNT_JSON: $GMC_SERVICE_ACCOUNT_JSON
+              GMC_SERVICE_ACCOUNT_EMAIL: $GMC_SERVICE_ACCOUNT_EMAIL
+              GMC_GCP_PROJECT_ID: $GMC_GCP_PROJECT_ID
+              GMC_MERCHANT_ACCOUNT_ID: $GMC_MERCHANT_ACCOUNT_ID
+              GMC_DATASOURCE_ID: $GMC_DATASOURCE_ID
+              GMC_ENV: $GMC_ENV
+              PRICE_SYNC_MODE: $PRICE_SYNC_MODE
+              PRICE_SYNC_DELETES: $PRICE_SYNC_DELETES
+              PRICE_SYNC_SHIPPING: $PRICE_SYNC_SHIPPING
+            annotations:
+              include-ims-credentials: true
+              final: true
+            limits:
+              # Scheduled invocations are non-blocking, so up to 3 hours is allowed.
+              # A full write of ~52K offers takes roughly 30 minutes.
+              timeout: 10800000
+              memorySize: 1024
+              concurrency: 1
+
+        triggers:
+          # Cron is UTC. 08:15 is after promos change over at midnight Pacific
+          # year-round; the 10:15 firing only resumes a pass that didn't finish
+          # (a completed pass makes it a no-op).
+          price-sync-daily:
+            feed: /whisk.system/alarms/alarm
+            inputs:
+              cron: '15 8,10 * * *'
+
+        rules:
+          price-sync-daily-rule:
+            trigger: price-sync-daily
+            action: price-sync
+
+    # App Builder Database Storage for price-sync's last-sent records. Requires the
+    # "App Builder Data Services" API in the workspace (Developer Console);
+    # provisioned on `aio app deploy`. Region must match DB_REGION in
+    # actions/lib/priceStore.js.
+    database:
+      auto-provision: true
+      region: amer

@@ -66,6 +66,12 @@ jobs:
           GMC_SERVICE_ACCOUNT_JSON: ${{ secrets.GMC_SERVICE_ACCOUNT_JSON }}
           GMC_SERVICE_ACCOUNT_EMAIL: ${{ secrets.GMC_SERVICE_ACCOUNT_EMAIL }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          # price-sync (daily Zazzle -> GMC price job): off | dry-run | live;
+          # report | enabled for deleting offers Zazzle no longer returns;
+          # ignore | send for writing Zazzle's per-offer shipping rates.
+          PRICE_SYNC_MODE: 'off'
+          PRICE_SYNC_DELETES: 'report'
+          PRICE_SYNC_SHIPPING: 'send'
         uses: adobe/aio-apps-action@4.1.0
         with:
           os: ${{ matrix.os }}
