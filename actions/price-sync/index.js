@@ -55,7 +55,7 @@ function alertLine (env, runId, message) {
 }
 
 function summaryFields (summary) {
-  if (summary.skipped) return { status: 'skipped', reason: summary.reason, run: summary.runId }
+  if (summary.skipped) return { status: 'skipped', reason: summary.reason, run: summary.runId, lockedUntil: summary.lockHeldUntil && new Date(summary.lockHeldUntil).toISOString() }
   const c = summary.counters
   return {
     status: summary.status,

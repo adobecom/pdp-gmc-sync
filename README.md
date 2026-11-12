@@ -218,17 +218,32 @@ database (`database.auto-provision` in `app.config.yaml`, region `amer`).
 `price-sync` and `sync-products` get their database token through the
 `include-ims-credentials` annotation.
 
-**Manual runs** (namespace credentials required):
+**Manual runs** (after `aio login` and `aio app use <workspace json>`).
+Invoke without `--result`, then fetch the result by activation id: a blocking
+invoke whose action errors comes back as HTTP 502, which the aio CLI silently
+retries (twice), starting extra runs and hiding the original error.
 ```bash
 # read-only: read + diff, no Google writes
-aio runtime action invoke gmc-feed-sync/price-sync -p dryRun true -p maxPages 3 --result
-# limited live run (test account), e.g. the first 50 writes
-aio runtime action invoke gmc-feed-sync/price-sync -p force true -p maxWrites 50 --result
+aio runtime action invoke gmc-feed-sync/price-sync -p dryRun true -p maxPages 3
+# limited live run: first 3 pages (300 products), ends with status=stopped
+aio runtime action invoke gmc-feed-sync/price-sync -p maxPages 3
+# each invoke prints an activation id; after it finishes:
+aio runtime activation result <activationId>
+aio runtime activation list --limit 10      # recent runs, with duration and status
 # rehearse against live Zazzle from your machine (no credentials, writes nothing)
 node scripts/price-sync-dry-run.js --pages 5
 ```
 `force` starts a new pass even if one already completed today. A pass stopped
 by `maxPages` is resumed by the next invocation.
+
+`reason: locked` means another invocation is running, or one crashed without
+releasing the lock; the response's `lockHeldUntil` says when it frees up (at
+most 30 minutes after the holder's last progress). To check or clear it by
+hand, only when you're sure nothing is running:
+```bash
+aio app db document find price_sync_locks '{}'
+aio app db document delete price_sync_locks '{"_id": "price-sync"}'
+```
 
 ### Monitoring
 

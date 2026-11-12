@@ -64,6 +64,11 @@ function offerUpdate (runId, now, r) {
   }
 }
 
+// App Builder Database answers a duplicate insert with HTTP 409 / E11000.
+function isDuplicateKeyError (e) {
+  return e?.httpStatusCode === 409 || /E11000/.test(String(e?.message))
+}
+
 const UNSEEN_MANAGED = runId => ({ sentAt: { $ne: null }, lastSeenRunId: { $ne: runId } })
 
 class DbPriceStore {
@@ -151,17 +156,23 @@ class DbPriceStore {
     await this.runs.updateOne({ _id: runId }, { $set: fields })
   }
 
-  // Insert the lock doc if absent, else take it over only if it has expired,
-  // then read it back: whoever's id is stored holds the lock.
+  // Decided from write results only: reads can briefly lag writes, and
+  // findOne throws when the document isn't visible yet. A successful insert
+  // of the fixed _id creates the lock; on a duplicate, an expired lock is
+  // taken over atomically (matchedCount 1). The read at the end only reports
+  // who holds it.
   async acquireLock (holder, now, ttlMs) {
     const heldUntil = new Date(now.getTime() + ttlMs)
     try {
       await this.locks.insertOne({ _id: LOCK_ID, holder, heldUntil })
-    } catch {
-      await this.locks.updateOne({ _id: LOCK_ID, heldUntil: { $lt: now } }, { $set: { holder, heldUntil } })
+      return { acquired: true }
+    } catch (e) {
+      if (!isDuplicateKeyError(e)) throw e
     }
-    const doc = await this.locks.findOne({ _id: LOCK_ID })
-    return doc?.holder === holder
+    const res = await this.locks.updateOne({ _id: LOCK_ID, heldUntil: { $lt: now } }, { $set: { holder, heldUntil } })
+    if (res?.matchedCount === 1) return { acquired: true, tookOver: true }
+    const [current] = await this.locks.find({ _id: LOCK_ID }).toArray()
+    return { acquired: false, holder: current?.holder ?? null, heldUntil: current?.heldUntil ?? null }
   }
 
   async refreshLock (holder, now, ttlMs) {
@@ -250,8 +261,12 @@ class MemoryPriceStore {
   }
 
   async acquireLock (holder, now, ttlMs) {
-    if (!this.lock || this.lock.heldUntil < now) this.lock = { holder, heldUntil: new Date(now.getTime() + ttlMs) }
-    return this.lock.holder === holder
+    if (!this.lock || this.lock.heldUntil < now) {
+      const tookOver = !!this.lock
+      this.lock = { holder, heldUntil: new Date(now.getTime() + ttlMs) }
+      return tookOver ? { acquired: true, tookOver } : { acquired: true }
+    }
+    return { acquired: false, holder: this.lock.holder, heldUntil: this.lock.heldUntil }
   }
 
   async refreshLock (holder, now, ttlMs) {
@@ -305,4 +320,4 @@ async function invalidatePriceRecords (params, offerIds, logger, { timeoutMs = 5
   }
 }
 
-module.exports = { DbPriceStore, MemoryPriceStore, openPriceStore, invalidatePriceRecords, offerUpdate, DB_REGION, OFFERS, RUNS, LOCKS }
+module.exports = { DbPriceStore, MemoryPriceStore, openPriceStore, invalidatePriceRecords, offerUpdate, isDuplicateKeyError, DB_REGION, OFFERS, RUNS, LOCKS }

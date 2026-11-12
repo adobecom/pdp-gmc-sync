@@ -34,8 +34,11 @@ const DEFAULTS = Object.freeze({
   expiryRiskDays: 27,
   notFoundRetryDays: 7,
   abortAfterFailedPages: 3,
+  settleMs: 5000,
   sampleLimit: 20
 })
+
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 
 function newCounters () {
   return {
@@ -257,11 +260,15 @@ async function handleDeletes (ctx, completeness) {
     report.blockedReason = `incomplete pass: ${completeness.reasons.join('; ')}`
     return report
   }
+  // Reads can briefly lag writes, so give this pass's last page time to land
+  // and never count an offer this invocation saw as unseen.
+  if (o.settleMs > 0) await (ctx.sleep || sleep)(o.settleMs)
   const unseen = await store.findUnseenManaged(run._id, o.deleteListLimit)
-  report.candidates = unseen.total
-  report.sample = unseen.offerIds.slice(0, o.sampleLimit)
-  report.offerIds = unseen.offerIds
-  if (!unseen.total) return report
+  const offerIds = unseen.offerIds.filter(id => !ctx.seen.has(id))
+  report.candidates = Math.max(0, unseen.total - (unseen.offerIds.length - offerIds.length))
+  report.sample = offerIds.slice(0, o.sampleLimit)
+  report.offerIds = offerIds
+  if (!report.candidates) return report
 
   const last = await store.getLastCompleteRun()
   if (last?.firstTotalCount && run.firstTotalCount < last.firstTotalCount * (1 - o.maxTotalCountDropPct / 100)) {
@@ -269,8 +276,8 @@ async function handleDeletes (ctx, completeness) {
     report.blockedReason = `totalCount fell ${drop}% since the last complete pass (${last.firstTotalCount} -> ${run.firstTotalCount})`
     return report
   }
-  if (unseen.total > run.firstTotalCount * (o.maxDeleteFractionPct / 100)) {
-    report.blockedReason = `${unseen.total} candidates exceed ${o.maxDeleteFractionPct}% of totalCount ${run.firstTotalCount}`
+  if (report.candidates > run.firstTotalCount * (o.maxDeleteFractionPct / 100)) {
+    report.blockedReason = `${report.candidates} candidates exceed ${o.maxDeleteFractionPct}% of totalCount ${run.firstTotalCount}`
     return report
   }
   if (o.deletes !== 'enabled') {
@@ -279,7 +286,7 @@ async function handleDeletes (ctx, completeness) {
   }
 
   const target = { accountId: o.accountId, dataSource: o.dataSource, contentLanguage: o.contentLanguage, feedLabel: o.feedLabel }
-  const outcomes = await runPool(unseen.offerIds, id => deleteOffer(ctx.productInputs, buildDeleteRequest(id, target), id, ctx.retry), o.concurrency)
+  const outcomes = await runPool(offerIds, id => deleteOffer(ctx.productInputs, buildDeleteRequest(id, target), id, ctx.retry), o.concurrency)
   const deletedIds = []
   outcomes.forEach(r => {
     if (r.ok) deletedIds.push(r.offerId)
@@ -312,8 +319,25 @@ async function runPriceSync (deps, opts) {
   const holder = newRunId(now())
 
   if (live) {
-    const acquired = await deps.store.acquireLock(holder, now(), o.lockTtlMs)
-    if (!acquired) return { skipped: true, reason: 'locked', message: 'another price-sync invocation holds the lock' }
+    let lock
+    try {
+      lock = await deps.store.acquireLock(holder, now(), o.lockTtlMs)
+    } catch (e) {
+      // The lock write may have landed even though the call failed; don't
+      // leave it behind to block the next invocation.
+      await deps.store.releaseLock(holder).catch(() => {})
+      throw e
+    }
+    if (!lock.acquired) {
+      return {
+        skipped: true,
+        reason: 'locked',
+        message: 'another price-sync invocation holds the lock',
+        lockHolder: lock.holder || null,
+        lockHeldUntil: lock.heldUntil || null
+      }
+    }
+    if (lock.tookOver) logger.warn?.('price-sync: took over an expired lock (a previous invocation ended without releasing it)')
   }
 
   try {
@@ -331,6 +355,7 @@ async function runPriceSync (deps, opts) {
     const ctx = {
       o, run, live, now, logger,
       store: deps.store,
+      sleep: deps.sleep,
       productInputs: deps.productInputs,
       retry: deps.retry,
       seen: new Set(),
