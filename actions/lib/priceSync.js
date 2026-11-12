@@ -468,7 +468,10 @@ async function runPriceSync (deps, opts) {
         completeness,
         deletes: { ...deleteSummary, offerIds: deleteOfferIds || [] },
         health,
-        heartbeatAt: now()
+        heartbeatAt: now(),
+        // Time spent working, summed over invocations; startedAt..finishedAt
+        // also counts the gaps between a pass being cut short and resumed.
+        activeMs: (run.activeMs || 0) + (now().getTime() - startedMs)
       })
     }
 

@@ -235,6 +235,15 @@ database (`database.auto-provision` in `app.config.yaml`, region `amer`).
 `price-sync` and `sync-products` get their database token through the
 `include-ims-credentials` annotation.
 
+**Deploy through GitHub only** (push to `main` for stage, a release for
+prod). `aio app deploy` and `aio app run` (which also deploys actions) take
+the action inputs from your local `.env`; with them missing, every action in
+the workspace would be redeployed with empty configuration. A pre-deploy hook
+(`scripts/check-deploy-inputs.js`) refuses to deploy unless `GMC_ENV`,
+`GMC_MERCHANT_ACCOUNT_ID`, `GMC_DATASOURCE_ID`, `GMC_SERVICE_ACCOUNT_JSON` and
+`PRICE_SYNC_MODE` are set. If a bad deploy happens, re-run the latest
+"Deploy to Stage" workflow in GitHub Actions to restore stage.
+
 **Manual runs** (after `aio login` and `aio app use <workspace json>`).
 Invoke without `--result`, then fetch the result by activation id: a blocking
 invoke whose action errors comes back as HTTP 502, which the aio CLI silently

@@ -31,6 +31,14 @@ export function duration (start, end) {
   return `${(mins / 60).toFixed(1)} h`
 }
 
+// Working time for a run: activeMs when recorded, else wall-clock time.
+export function runDuration (run) {
+  const label = run.activeMs != null
+    ? duration(0, run.activeMs)
+    : duration(run.startedAt, run.finishedAt || run.heartbeatAt)
+  return run.resumeCount ? `${label} (resumed)` : label
+}
+
 export const num = n => (n == null ? '—' : Number(n).toLocaleString())
 
 // "00:15" -> "12:15 AM"

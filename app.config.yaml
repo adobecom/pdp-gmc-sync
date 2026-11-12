@@ -3,6 +3,11 @@ application:
   # Admin app (runs dashboard + settings), served from App Builder static
   # hosting and opened through Experience Cloud. See README "Admin app".
   web: web-src
+  # Refuse `aio app deploy` / `aio app run` with blank action inputs, which
+  # would wipe the deployed configuration (see the script).
+  hooks:
+    pre-app-deploy: scripts/check-deploy-inputs.js
+    pre-app-run: scripts/check-deploy-inputs.js
   runtimeManifest:
     packages:
       gmc-feed-sync:
