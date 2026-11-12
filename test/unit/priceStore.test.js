@@ -10,7 +10,7 @@ function fakeClient () {
     insertOne: jest.fn(async () => ({})),
     updateOne: jest.fn(async () => ({})),
     deleteOne: jest.fn(async () => ({})),
-    findOne: jest.fn(async () => null)
+    findOne: jest.fn(async () => { throw new Error('findOne must not be used: the service throws "Document not found" instead of returning null') })
   })
   return {
     collections,
@@ -55,17 +55,43 @@ describe('DbPriceStore', () => {
     expect(offers.find).toHaveBeenCalledWith({ sentAt: { $ne: null }, lastSeenRunId: { $ne: 'run-9' } }, { projection: { _id: 1 }, limit: 100 })
   })
 
-  test('lock: acquired when inserted or taken over, refused when someone else holds it', async () => {
-    const client = fakeClient()
-    const store = new DbPriceStore(client)
-    const locks = client.collection(LOCKS)
-    locks.findOne.mockResolvedValueOnce({ holder: 'me' })
-    expect(await store.acquireLock('me', NOW, 1000)).toBe(true)
+  describe('lock (decided from write results, never by reading the lock back)', () => {
+    const duplicate = () => Object.assign(new Error('Request x to v1/collection/price_sync_locks/insertOne failed with code 409: E11000 duplicate key error'), { httpStatusCode: 409 })
 
-    locks.insertOne.mockRejectedValueOnce(new Error('E11000 duplicate key'))
-    locks.findOne.mockResolvedValueOnce({ holder: 'other' })
-    expect(await store.acquireLock('me', NOW, 1000)).toBe(false)
-    expect(locks.updateOne).toHaveBeenLastCalledWith({ _id: 'price-sync', heldUntil: { $lt: NOW } }, { $set: { holder: 'me', heldUntil: new Date(NOW.getTime() + 1000) } })
+    test('a successful insert holds the lock', async () => {
+      const client = fakeClient()
+      const locks = client.collection(LOCKS)
+      expect(await new DbPriceStore(client).acquireLock('me', NOW, 1000)).toEqual({ acquired: true })
+      expect(locks.insertOne).toHaveBeenCalledWith({ _id: 'price-sync', holder: 'me', heldUntil: new Date(NOW.getTime() + 1000) })
+      expect(locks.updateOne).not.toHaveBeenCalled()
+    })
+
+    test('an existing but expired lock is taken over atomically', async () => {
+      const client = fakeClient()
+      const locks = client.collection(LOCKS)
+      locks.insertOne.mockRejectedValueOnce(duplicate())
+      locks.updateOne.mockResolvedValueOnce({ acknowledged: true, matchedCount: 1, modifiedCount: 1 })
+      expect(await new DbPriceStore(client).acquireLock('me', NOW, 1000)).toEqual({ acquired: true, tookOver: true })
+      expect(locks.updateOne).toHaveBeenCalledWith({ _id: 'price-sync', heldUntil: { $lt: NOW } }, { $set: { holder: 'me', heldUntil: new Date(NOW.getTime() + 1000) } })
+    })
+
+    test('a live lock is refused and reports its holder', async () => {
+      const client = fakeClient()
+      const locks = client.collection(LOCKS)
+      locks.insertOne.mockRejectedValueOnce(duplicate())
+      locks.updateOne.mockResolvedValueOnce({ acknowledged: true, matchedCount: 0, modifiedCount: 0 })
+      const heldUntil = new Date(NOW.getTime() + 60000)
+      locks.find.mockReturnValueOnce({ toArray: async () => [{ _id: 'price-sync', holder: 'other', heldUntil }] })
+      expect(await new DbPriceStore(client).acquireLock('me', NOW, 1000)).toEqual({ acquired: false, holder: 'other', heldUntil })
+    })
+
+    test('any other insert failure is an error, not "locked"', async () => {
+      const client = fakeClient()
+      const locks = client.collection(LOCKS)
+      locks.insertOne.mockRejectedValueOnce(Object.assign(new Error('failed with code 503'), { httpStatusCode: 503 }))
+      await expect(new DbPriceStore(client).acquireLock('me', NOW, 1000)).rejects.toThrow('503')
+      expect(locks.updateOne).not.toHaveBeenCalled()
+    })
   })
 
   test('latest run lookups sort by startedAt', async () => {

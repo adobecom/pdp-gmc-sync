@@ -61,7 +61,8 @@ const baseOpts = {
   contentLanguage: 'en',
   feedLabel: 'US',
   expectedCurrency: 'USD',
-  concurrency: 3
+  concurrency: 3,
+  settleMs: 0
 }
 
 function harness () {
@@ -123,10 +124,31 @@ describe('runPriceSync', () => {
     expect(await h.run(zazzle([product(1)]), google(), { force: true })).toMatchObject({ status: 'complete' })
   })
 
-  test('skips when another invocation holds the lock', async () => {
+  test('skips when another invocation holds the lock, saying who and until when', async () => {
     const h = harness()
     await h.store.acquireLock('someone-else', T0, 60000)
-    expect(await h.run(zazzle([product(1)]), google())).toMatchObject({ skipped: true, reason: 'locked' })
+    expect(await h.run(zazzle([product(1)]), google())).toMatchObject({
+      skipped: true, reason: 'locked', lockHolder: 'someone-else', lockHeldUntil: new Date(T0.getTime() + 60000)
+    })
+  })
+
+  test('a lock left behind by a crashed invocation is taken over once it expires', async () => {
+    const h = harness()
+    await h.store.acquireLock('crashed', T0, 60000)
+    h.advance(61000)
+    expect(await h.run(zazzle([product(1)]), google())).toMatchObject({ status: 'complete' })
+    expect(h.store.lock).toBeNull()
+  })
+
+  test('if acquiring the lock throws, nothing is left locked and the error surfaces', async () => {
+    const h = harness()
+    const original = h.store.acquireLock.bind(h.store)
+    h.store.acquireLock = async (holder, now, ttl) => {
+      await original(holder, now, ttl)
+      throw new Error('Document not found')
+    }
+    await expect(h.run(zazzle([product(1)]), google())).rejects.toThrow('Document not found')
+    expect(h.store.lock).toBeNull()
   })
 
   test('NOT_FOUND offers are reported, tracked, and never become delete candidates', async () => {
@@ -184,6 +206,25 @@ describe('runPriceSync', () => {
     expect(enabled.deletes).toMatchObject({ candidates: 1, deleted: 1, blockedReason: null })
     expect(g.deleteProductInput).toHaveBeenCalledWith({ name: `accounts/1/productInputs/en~US~${uuid(40)}`, dataSource: 'accounts/1/dataSources/2' })
     expect(h.store.offers.has(uuid(40))).toBe(false)
+  })
+
+  test('an offer seen this pass is never a delete candidate, even if the database read lags', async () => {
+    const products = Array.from({ length: 40 }, (_, i) => product(i + 1))
+    const h = harness()
+    await h.run(zazzle(products, { pageSize: 10 }), google())
+    h.advance(DAY_MS)
+    const real = h.store.findUnseenManaged.bind(h.store)
+    h.store.findUnseenManaged = async (runId, limit) => {
+      const r = await real(runId, limit)
+      return { total: r.total + 1, offerIds: [...r.offerIds, uuid(40)] }
+    }
+    const sleep = jest.fn(async () => {})
+    const summary = await runPriceSync(
+      { store: h.store, productInputs: google(), fetchPage: zazzle(products, { pageSize: 10 }), logger: quietLogger, now: () => new Date(T0.getTime() + DAY_MS), sleep, retry: { retryDelaysMs: [] } },
+      { ...baseOpts, settleMs: 5000 }
+    )
+    expect(sleep).toHaveBeenCalledWith(5000)
+    expect(summary.deletes).toMatchObject({ candidates: 0, sample: [] })
   })
 
   test('no deletes after an incomplete pass, a >5% totalCount drop, or too many candidates', async () => {
