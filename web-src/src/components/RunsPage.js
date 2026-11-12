@@ -8,7 +8,7 @@ import Download from '@spectrum-icons/workflow/Download'
 import RunDetail from './RunDetail'
 import StatusChip from './StatusChip'
 import { fetchAllOffers } from '../api'
-import { when, ago, duration, num, whenPacific, TRIGGERS, csv, download } from '../format'
+import { when, ago, runDuration, num, whenPacific, TRIGGERS, csv, download } from '../format'
 
 function Card ({ title, help, children }) {
   return (
@@ -194,7 +194,7 @@ export default function RunsPage ({ call, overview, refreshOverview }) {
                       <Cell>{when(r.startedAt)}</Cell>
                       <Cell>{r.trigger === 'manual' && r.requestedBy ? r.requestedBy : (TRIGGERS[r.trigger] || 'Scheduled')}</Cell>
                       <Cell><StatusChip status={r.displayStatus} /></Cell>
-                      <Cell>{duration(r.startedAt, r.finishedAt || r.heartbeatAt)}</Cell>
+                      <Cell>{runDuration(r)}</Cell>
                       <Cell>{num(c.returned)}</Cell>
                       <Cell>{num(c.written)}</Cell>
                       <Cell>{num((c.notFound || 0) + (c.notInGmcSkipped || 0))}</Cell>

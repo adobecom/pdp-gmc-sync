@@ -141,6 +141,17 @@ describe('runPriceSync', () => {
     expect(h.store.runs.get(fresh.runId)).toMatchObject({ slot: 's3', trigger: 'manual', requestedBy: 'ed@adobe.com' })
   })
 
+  test('activeMs counts working time only, not the gap before a resume', async () => {
+    const h = harness()
+    const products = [1, 2, 3].map(n => product(n))
+    const slow = z => jest.fn(async a => { h.advance(60 * 1000); return z(a) })
+    const cut = await h.run(slow(zazzle(products, { failAt: '1002', failTimes: 1 })), google(), { slot: 's1' })
+    h.advance(8 * 60 * 60 * 1000)
+    await h.run(slow(zazzle(products)), google(), { slot: 's1' })
+    const run = h.store.runs.get(cut.runId)
+    expect(run).toMatchObject({ status: 'complete', resumeCount: 1, activeMs: 3 * 60 * 1000 })
+  })
+
   test('skips when another invocation holds the lock, saying who and until when', async () => {
     const h = harness()
     await h.store.acquireLock('someone-else', T0, 60000)

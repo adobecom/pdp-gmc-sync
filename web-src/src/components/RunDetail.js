@@ -2,7 +2,7 @@ import React, { useEffect, useState } from 'react'
 import { useDialogContainer, Dialog, Heading, Divider, Content, ButtonGroup, Button, ProgressCircle, Flex, View, Text, InlineAlert, Grid, LabeledValue, ActionButton } from '@adobe/react-spectrum'
 import Download from '@spectrum-icons/workflow/Download'
 import StatusChip from './StatusChip'
-import { when, duration, num, TRIGGERS, STATUS, csv, download } from '../format'
+import { when, duration, runDuration, num, TRIGGERS, STATUS, csv, download } from '../format'
 
 function problemsOf (run) {
   const out = []
@@ -67,7 +67,8 @@ export default function RunDetail ({ call, runId }) {
             <Grid columns='repeat(auto-fit, minmax(180px, 1fr))' gap='size-200'>
               <Stat label='Started' value={when(run.startedAt)} />
               <Stat label='Finished' value={run.finishedAt ? when(run.finishedAt) : '—'} />
-              <Stat label='Took' value={duration(run.startedAt, run.finishedAt || run.heartbeatAt)} />
+              <Stat label='Working time' value={runDuration(run)} />
+              {run.resumeCount > 0 && <Stat label='Start to finish' value={duration(run.startedAt, run.finishedAt || run.heartbeatAt)} />}
               <Stat label='Started by' value={run.requestedBy || TRIGGERS[run.trigger] || 'Scheduled'} />
               <Stat label='Resumed' value={run.resumeCount ? `${run.resumeCount} time(s)` : 'No'} />
             </Grid>
