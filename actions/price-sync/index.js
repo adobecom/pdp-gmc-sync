@@ -1,11 +1,15 @@
-// Scheduled daily (see the price-sync-daily trigger in app.config.yaml) and
-// invokable by namespace holders for testing:
+// Started by price-sync-scheduler at the times set in the admin app, by the
+// admin app's "Run now", and invokable by namespace holders for testing:
 //   aio rt action invoke gmc-feed-sync/price-sync -p dryRun true -p maxPages 2
 // Deploy-time inputs (final, not overridable per invocation):
-//   PRICE_SYNC_MODE     off (default) | dry-run | live
-//   PRICE_SYNC_DELETES  report (default) | enabled
-//   PRICE_SYNC_SHIPPING ignore (default) | send — write Zazzle's per-offer shipping
-// Invocation params: dryRun, force, maxPages, maxWrites, concurrency, retryNotFound.
+//   PRICE_SYNC_MODE     off (default) | dry-run | live — the ceiling
+//   PRICE_SYNC_DELETES  report (default) | enabled — until set in the admin app
+//   PRICE_SYNC_SHIPPING ignore (default) | send — until set in the admin app
+// Admin app settings (price_sync_settings) supply deletes, shipping, the
+// refresh window, notFoundRetryDays and a default maxWrites.
+// Invocation params: dryRun, force, maxPages, maxWrites, concurrency,
+// retryNotFound, and slot / trigger / requestedBy (set by the scheduler and
+// the admin app).
 
 const { Core } = require('@adobe/aio-sdk')
 const { makeClients } = require('../lib/gmcClients')
@@ -13,11 +17,11 @@ const { resolveAccount, resolveDataSource } = require('../lib/config')
 const { fetchBulkPricingPage, DEFAULT_URL } = require('../lib/zazzleBulkPricing')
 const { openPriceStore, MemoryPriceStore } = require('../lib/priceStore')
 const { runPriceSync, formatPriceSyncDigest, alertsFor } = require('../lib/priceSync')
+const { effectiveSettings, deployMode, resolveDeletes, resolveShipping } = require('../lib/priceSyncSettings')
 const { redact } = require('../lib/redact')
 const { errorResponse } = require('../utils')
 const defaults = require('../../config/defaults.json')
 
-const MODES = new Set(['off', 'dry-run', 'live'])
 const DELETE_LIST_LOG_CHUNK = 500
 
 function isTrue (v) {
@@ -25,8 +29,7 @@ function isTrue (v) {
 }
 
 function resolveMode (params) {
-  const configured = String(params.PRICE_SYNC_MODE || 'off').trim().toLowerCase()
-  if (!MODES.has(configured)) throw new Error(`PRICE_SYNC_MODE must be off, dry-run or live, got ${JSON.stringify(params.PRICE_SYNC_MODE)}`)
+  const configured = deployMode(params)
   if (configured === 'live' && isTrue(params.dryRun)) return 'dry-run'
   return configured
 }
@@ -61,6 +64,7 @@ function summaryFields (summary) {
     status: summary.status,
     mode: summary.mode,
     run: summary.runId,
+    trigger: summary.trigger,
     resumed: summary.resumed ? 'yes' : 'no',
     durationMin: (summary.durationMs / 60000).toFixed(1),
     total: summary.pass.totalCount,
@@ -140,6 +144,22 @@ async function main (params) {
     store = new MemoryPriceStore()
   }
 
+  let settings
+  try {
+    const eff = effectiveSettings(await store.getSettingsDoc())
+    if (eff.problem) logger.warn(`price-sync: ${eff.problem}`)
+    settings = eff.settings
+  } catch (e) {
+    logger.warn(`price-sync: reading settings failed (${e.message}); using defaults`)
+    settings = effectiveSettings(null).settings
+  }
+  const trigger = typeof params.trigger === 'string' ? params.trigger : 'cli'
+  if (trigger === 'schedule' && settings.paused) {
+    logger.info('price-sync: scheduled runs are paused in the admin app, nothing to do')
+    await store.close().catch(() => {})
+    return { statusCode: 200, body: { skipped: true, reason: 'paused' } }
+  }
+
   const deadlineMs = Number(process.env.__OW_DEADLINE) || undefined
   try {
     const summary = await runPriceSync({
@@ -154,8 +174,14 @@ async function main (params) {
       })
     }, {
       mode,
-      deletes: params.PRICE_SYNC_DELETES === 'enabled' ? 'enabled' : 'report',
-      shipping: params.PRICE_SYNC_SHIPPING === 'send' ? 'send' : 'ignore',
+      deletes: resolveDeletes(settings, params),
+      shipping: resolveShipping(settings, params),
+      refreshAfterDays: settings.refreshAfterDays,
+      refreshJitterDays: settings.refreshJitterDays,
+      notFoundRetryDays: settings.notFoundRetryDays,
+      slot: typeof params.slot === 'string' && params.slot ? params.slot : undefined,
+      trigger,
+      requestedBy: typeof params.requestedBy === 'string' ? params.requestedBy : undefined,
       gmcEnv: params.GMC_ENV,
       accountId,
       dataSource,
@@ -165,7 +191,7 @@ async function main (params) {
       force: isTrue(params.force),
       retryNotFound: isTrue(params.retryNotFound),
       maxPages,
-      maxWrites,
+      maxWrites: maxWrites ?? settings.maxWritesPerRun ?? undefined,
       concurrency
     })
 

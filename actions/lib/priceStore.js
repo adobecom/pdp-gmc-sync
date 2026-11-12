@@ -5,13 +5,66 @@
 //     returned by Zazzle (for deletes) and failure tracking (for alerts).
 //   price_sync_runs — one doc per pass: status, resume cursor, counters.
 // A third, price_sync_locks, holds a single lock doc so two invocations never
-// run a pass concurrently. MemoryPriceStore implements the same interface for
-// tests and local dry runs.
+// run a pass concurrently. The admin app adds price_sync_settings (one doc),
+// price_sync_settings_history (who changed what) and price_sync_slots (one
+// doc per scheduled or manual run request, so each is started only once).
+// MemoryPriceStore implements the same interface for tests and local dry runs.
+
+const crypto = require('crypto')
 
 const OFFERS = 'price_sync_offers'
 const RUNS = 'price_sync_runs'
 const LOCKS = 'price_sync_locks'
+const SETTINGS = 'price_sync_settings'
+const SETTINGS_HISTORY = 'price_sync_settings_history'
+const SLOTS = 'price_sync_slots'
 const LOCK_ID = 'price-sync'
+const SETTINGS_ID = 'current'
+const DAY_MS = 24 * 3600 * 1000
+
+// List views leave out the bulky parts of a run doc (the delete list can hold
+// thousands of ids) to keep admin responses small.
+const RUN_LIST_EXCLUDE = ['cursor', 'holder', 'samples', 'deletes.offerIds', 'deletes.sample', 'health.repeatFailures']
+const RUN_DETAIL_EXCLUDE = ['cursor', 'holder', 'deletes.offerIds']
+
+// Offer exports for the admin app, paged by _id.
+const OFFER_VIEWS = {
+  notInGmc: {
+    filter: () => ({ notInGmc: true }),
+    match: () => d => d.notInGmc === true,
+    fields: ['templateId', 'notInGmcSince', 'notFoundAt', 'lastSeenAt']
+  },
+  failing: {
+    filter: () => ({ failCount: { $gte: 1 } }),
+    match: () => d => (d.failCount || 0) >= 1,
+    fields: ['templateId', 'failCount', 'lastError', 'lastFailedAt']
+  },
+  atRisk: {
+    filter: ({ now, days }) => ({ sentAt: { $ne: null, $lt: new Date(now.getTime() - days * DAY_MS) } }),
+    match: ({ now, days }) => d => d.sentAt != null && new Date(d.sentAt) < new Date(now.getTime() - days * DAY_MS),
+    fields: ['templateId', 'sentAt', 'lastSeenAt']
+  }
+}
+
+const exclusion = paths => Object.fromEntries(paths.map(p => [p, 0]))
+
+function omitPaths (doc, paths) {
+  const out = structuredClone(doc)
+  for (const p of paths) {
+    const keys = p.split('.')
+    const parent = keys.slice(0, -1).reduce((o, k) => (o && typeof o === 'object' ? o[k] : undefined), out)
+    if (parent && typeof parent === 'object') delete parent[keys[keys.length - 1]]
+  }
+  return out
+}
+
+const SETTINGS_META = ['_id', 'version', 'updatedAt', 'updatedBy']
+
+function settingsFields (doc) {
+  return doc ? Object.fromEntries(Object.entries(doc).filter(([k]) => !SETTINGS_META.includes(k))) : null
+}
+
+const historyId = at => `${new Date(at).toISOString()}-${crypto.randomBytes(3).toString('hex')}`
 
 // Must match application.runtimeManifest.database.region in app.config.yaml.
 const DB_REGION = 'amer'
@@ -77,6 +130,9 @@ class DbPriceStore {
     this.offers = client.collection(OFFERS)
     this.runs = client.collection(RUNS)
     this.locks = client.collection(LOCKS)
+    this.settings = client.collection(SETTINGS)
+    this.settingsHistory = client.collection(SETTINGS_HISTORY)
+    this.slots = client.collection(SLOTS)
   }
 
   async loadOffers (offerIds) {
@@ -183,6 +239,99 @@ class DbPriceStore {
     await this.locks.deleteOne({ _id: LOCK_ID, holder })
   }
 
+  async getLock () {
+    const [lock] = await this.locks.find({ _id: LOCK_ID }).toArray()
+    return lock || null
+  }
+
+  // One run per slot: the insert of the slot's _id is the claim.
+  async claimSlot (slotId, info) {
+    try {
+      await this.slots.insertOne({ _id: slotId, ...info })
+      return true
+    } catch (e) {
+      if (isDuplicateKeyError(e)) return false
+      throw e
+    }
+  }
+
+  async releaseSlot (slotId) {
+    await this.slots.deleteOne({ _id: slotId })
+  }
+
+  async getSlot (slotId) {
+    const [slot] = await this.slots.find({ _id: slotId }).toArray()
+    return slot || null
+  }
+
+  // Atomic: only one caller moves a slot from `attempts` to `attempts + 1`.
+  async retrySlot (slotId, attempts, now) {
+    const res = await this.slots.updateOne({ _id: slotId, attempts }, { $set: { lastInvokedAt: now }, $inc: { attempts: 1 } })
+    return res?.matchedCount === 1
+  }
+
+  async hasRunForSlot (slot) {
+    const runs = await this.runs.find({ slot }, { projection: { _id: 1 }, limit: 1 }).toArray()
+    return runs.length > 0
+  }
+
+  async getSettingsDoc () {
+    const [doc] = await this.settings.find({ _id: SETTINGS_ID }).toArray()
+    return doc || null
+  }
+
+  // Optimistic concurrency: the save only lands if nobody saved since the
+  // editor loaded `expectedVersion` (0 = never saved).
+  async saveSettings (value, { by, at, expectedVersion }) {
+    const before = settingsFields(await this.getSettingsDoc())
+    const version = expectedVersion + 1
+    const doc = { ...value, version, updatedAt: at, updatedBy: by }
+    if (expectedVersion === 0) {
+      try {
+        await this.settings.insertOne({ _id: SETTINGS_ID, ...doc })
+      } catch (e) {
+        if (isDuplicateKeyError(e)) return { conflict: true }
+        throw e
+      }
+    } else {
+      const res = await this.settings.updateOne({ _id: SETTINGS_ID, version: expectedVersion }, { $set: doc })
+      if (res?.matchedCount !== 1) return { conflict: true }
+    }
+    await this.settingsHistory.insertOne({ _id: historyId(at), at, by, version, before, after: value })
+    return { ok: true, version }
+  }
+
+  async listSettingsHistory (limit) {
+    return this.settingsHistory.find({}, { sort: { at: -1 }, limit }).toArray()
+  }
+
+  async listRuns ({ limit, before }) {
+    const filter = before ? { startedAt: { $lt: new Date(before) } } : {}
+    return this.runs.find(filter, { sort: { startedAt: -1 }, limit, projection: exclusion(RUN_LIST_EXCLUDE) }).toArray()
+  }
+
+  async getRun (runId) {
+    const [run] = await this.runs.find({ _id: runId }, { projection: exclusion(RUN_DETAIL_EXCLUDE) }).toArray()
+    return run || null
+  }
+
+  async getDeleteCandidates (runId) {
+    const [run] = await this.runs.find({ _id: runId }, { projection: { 'deletes.offerIds': 1 } }).toArray()
+    return run ? run.deletes?.offerIds || [] : null
+  }
+
+  async listOffers (view, { after, limit, now, days }) {
+    const v = OFFER_VIEWS[view]
+    const base = v.filter({ now, days })
+    const filter = after ? { ...base, _id: { $gt: after } } : base
+    const projection = Object.fromEntries(v.fields.map(f => [f, 1]))
+    const [docs, total] = await Promise.all([
+      this.offers.find(filter, { sort: { _id: 1 }, limit, projection }).toArray(),
+      after ? Promise.resolve(null) : this.offers.countDocuments(base)
+    ])
+    return { total, offers: docs.map(d => ({ offerId: d._id, ...Object.fromEntries(v.fields.map(f => [f, d[f] ?? null])) })) }
+  }
+
   async close () {
     await this.client.close()
   }
@@ -277,6 +426,84 @@ class MemoryPriceStore {
     if (this.lock?.holder === holder) this.lock = null
   }
 
+  async getLock () {
+    return this.lock ? { _id: LOCK_ID, ...structuredClone(this.lock) } : null
+  }
+
+  async claimSlot (slotId, info) {
+    this.slotClaims = this.slotClaims || new Map()
+    if (this.slotClaims.has(slotId)) return false
+    this.slotClaims.set(slotId, { _id: slotId, ...structuredClone(info) })
+    return true
+  }
+
+  async releaseSlot (slotId) {
+    this.slotClaims?.delete(slotId)
+  }
+
+  async getSlot (slotId) {
+    const slot = this.slotClaims?.get(slotId)
+    return slot ? structuredClone(slot) : null
+  }
+
+  async retrySlot (slotId, attempts, now) {
+    const slot = this.slotClaims?.get(slotId)
+    if (!slot || slot.attempts !== attempts) return false
+    slot.attempts++
+    slot.lastInvokedAt = now
+    return true
+  }
+
+  async hasRunForSlot (slot) {
+    return [...this.runs.values()].some(r => r.slot === slot)
+  }
+
+  async getSettingsDoc () {
+    return this.settingsDoc ? structuredClone(this.settingsDoc) : null
+  }
+
+  async saveSettings (value, { by, at, expectedVersion }) {
+    if ((this.settingsDoc?.version || 0) !== expectedVersion) return { conflict: true }
+    const before = settingsFields(this.settingsDoc)
+    const version = expectedVersion + 1
+    this.settingsDoc = { _id: SETTINGS_ID, ...structuredClone(value), version, updatedAt: at, updatedBy: by }
+    this.history = this.history || []
+    this.history.push({ _id: historyId(at), at, by, version, before, after: structuredClone(value) })
+    return { ok: true, version }
+  }
+
+  async listSettingsHistory (limit) {
+    return [...(this.history || [])].sort((a, b) => b.at - a.at).slice(0, limit).map(h => structuredClone(h))
+  }
+
+  async listRuns ({ limit, before }) {
+    return [...this.runs.values()]
+      .filter(r => !before || new Date(r.startedAt) < new Date(before))
+      .sort((a, b) => b.startedAt - a.startedAt)
+      .slice(0, limit)
+      .map(r => omitPaths(r, RUN_LIST_EXCLUDE))
+  }
+
+  async getRun (runId) {
+    const run = this.runs.get(runId)
+    return run ? omitPaths(run, RUN_DETAIL_EXCLUDE) : null
+  }
+
+  async getDeleteCandidates (runId) {
+    const run = this.runs.get(runId)
+    return run ? [...(run.deletes?.offerIds || [])] : null
+  }
+
+  async listOffers (view, { after, limit, now, days }) {
+    const v = OFFER_VIEWS[view]
+    const matching = [...this.offers.values()].filter(v.match({ now, days })).sort((a, b) => (a._id < b._id ? -1 : a._id > b._id ? 1 : 0))
+    const page = matching.filter(d => !after || d._id > after).slice(0, limit)
+    return {
+      total: after ? null : matching.length,
+      offers: page.map(d => ({ offerId: d._id, ...Object.fromEntries(v.fields.map(f => [f, d[f] ?? null])) }))
+    }
+  }
+
   async close () {}
 }
 
@@ -320,4 +547,4 @@ async function invalidatePriceRecords (params, offerIds, logger, { timeoutMs = 5
   }
 }
 
-module.exports = { DbPriceStore, MemoryPriceStore, openPriceStore, invalidatePriceRecords, offerUpdate, isDuplicateKeyError, DB_REGION, OFFERS, RUNS, LOCKS }
+module.exports = { DbPriceStore, MemoryPriceStore, openPriceStore, invalidatePriceRecords, offerUpdate, isDuplicateKeyError, OFFER_VIEWS, DB_REGION, OFFERS, RUNS, LOCKS, SETTINGS, SETTINGS_HISTORY, SLOTS }

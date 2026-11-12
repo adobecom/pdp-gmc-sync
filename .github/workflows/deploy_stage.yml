@@ -73,6 +73,9 @@ jobs:
           PRICE_SYNC_MODE: 'live'
           PRICE_SYNC_DELETES: 'report'
           PRICE_SYNC_SHIPPING: 'send'
+          # Admin app: comma-separated emails that may change settings and start
+          # runs (GitHub environment variable; anyone @adobe.com can view).
+          PRICE_SYNC_EDITORS: ${{ vars.PRICE_SYNC_EDITORS }}
         uses: adobe/aio-apps-action@4.1.0
         with:
           os: ${{ matrix.os }}

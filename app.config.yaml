@@ -1,5 +1,8 @@
 application:
   actions: actions
+  # Admin app (runs dashboard + settings), served from App Builder static
+  # hosting and opened through Experience Cloud. See README "Admin app".
+  web: web-src
   runtimeManifest:
     packages:
       gmc-feed-sync:
@@ -86,25 +89,63 @@ application:
               include-ims-credentials: true
               final: true
             limits:
-              # Scheduled invocations are non-blocking, so up to 3 hours is allowed.
+              # Started non-blocking by price-sync-scheduler, so up to 3 hours is allowed.
               # A full write of ~52K offers takes roughly 30 minutes.
               timeout: 10800000
               memorySize: 1024
               concurrency: 1
 
+          price-sync-scheduler:
+            function: actions/price-sync-scheduler/index.js
+            web: 'no'
+            runtime: nodejs:22
+            inputs:
+              LOG_LEVEL: $LOG_LEVEL
+              GMC_ENV: $GMC_ENV
+              PRICE_SYNC_MODE: $PRICE_SYNC_MODE
+            annotations:
+              include-ims-credentials: true
+              final: true
+            limits:
+              timeout: 60000
+              memorySize: 256
+              concurrency: 1
+
+          admin-api:
+            function: actions/admin-api/index.js
+            web: 'yes'
+            runtime: nodejs:22
+            inputs:
+              LOG_LEVEL: $LOG_LEVEL
+              GMC_ENV: $GMC_ENV
+              PRICE_SYNC_MODE: $PRICE_SYNC_MODE
+              PRICE_SYNC_DELETES: $PRICE_SYNC_DELETES
+              PRICE_SYNC_SHIPPING: $PRICE_SYNC_SHIPPING
+              # Comma-separated emails allowed to change settings and start runs
+              # (GitHub environment variable). Anyone @adobe.com can view.
+              PRICE_SYNC_EDITORS: $PRICE_SYNC_EDITORS
+            annotations:
+              # Callers are checked against Adobe IMS in lib/adminAuth instead.
+              require-adobe-auth: false
+              include-ims-credentials: true
+              final: true
+            limits:
+              timeout: 60000
+              memorySize: 512
+
         triggers:
-          # Cron is UTC. 08:15 is after promos change over at midnight Pacific
-          # year-round; the 10:15 firing only resumes a pass that didn't finish
-          # (a completed pass makes it a no-op).
-          price-sync-daily:
+          # Every 15 minutes; price-sync-scheduler starts price-sync at the times
+          # set in the admin app (Pacific, default 00:15, just after promos change
+          # over at midnight Pacific) and resumes passes that were cut short.
+          price-sync-tick:
             feed: /whisk.system/alarms/alarm
             inputs:
-              cron: '15 8,10 * * *'
+              cron: '*/15 * * * *'
 
         rules:
-          price-sync-daily-rule:
-            trigger: price-sync-daily
-            action: price-sync
+          price-sync-tick-rule:
+            trigger: price-sync-tick
+            action: price-sync-scheduler
 
     # App Builder Database Storage for price-sync's last-sent records. Requires the
     # "App Builder Data Services" API in the workspace (Developer Console);
