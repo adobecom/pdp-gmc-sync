@@ -79,25 +79,44 @@ function cfg (opts) {
   return { ...DEFAULTS, ...Object.fromEntries(Object.entries(opts || {}).filter(([, v]) => v !== undefined)) }
 }
 
+const RESUMABLE = ['aborted', 'stopped', 'running']
+
+function resumeRun (store, latest, holder, now) {
+  const run = { ...latest, resumeCount: (latest.resumeCount || 0) + 1, status: 'running', heartbeatAt: now }
+  return store.updateRun(run._id, { resumeCount: run.resumeCount, status: 'running', heartbeatAt: now, holder, abortReason: null })
+    .then(() => ({ run, resumed: true }))
+}
+
+// With a slot (scheduled or "Run now" requests), each slot is its own pass:
+// the same slot resumes or skips, a new slot starts over and marks an
+// unfinished earlier pass as interrupted. Without one (CLI invocations), a
+// pass started within runWindowHours is resumed or skipped.
 async function startOrResume (store, holder, now, o) {
   const latest = await store.getLatestRun()
-  const withinWindow = latest && now.getTime() - new Date(latest.startedAt).getTime() < o.runWindowHours * 3600 * 1000
-  if (withinWindow && !o.force) {
-    if (latest.status === 'complete' || latest.status === 'incomplete') {
-      return { skip: { reason: 'already-ran', runId: latest._id, status: latest.status } }
+  if (latest && !o.force) {
+    const sameSlot = o.slot != null && latest.slot === o.slot
+    const withinWindow = o.slot == null && now.getTime() - new Date(latest.startedAt).getTime() < o.runWindowHours * 3600 * 1000
+    if (sameSlot || withinWindow) {
+      if (latest.status === 'complete' || latest.status === 'incomplete') {
+        return { skip: { reason: 'already-ran', runId: latest._id, status: latest.status } }
+      }
+      // 'running' here means a crashed invocation: we hold the lock, so nobody
+      // else is running it.
+      if (RESUMABLE.includes(latest.status) && (latest.resumeCount || 0) < o.maxResumes) {
+        return resumeRun(store, latest, holder, now)
+      }
     }
-    // 'running' here means a crashed invocation: we hold the lock, so nobody
-    // else is running it.
-    if (['aborted', 'stopped', 'running'].includes(latest.status) && (latest.resumeCount || 0) < o.maxResumes) {
-      const run = { ...latest, resumeCount: (latest.resumeCount || 0) + 1, status: 'running', heartbeatAt: now }
-      await store.updateRun(run._id, { resumeCount: run.resumeCount, status: 'running', heartbeatAt: now, holder, abortReason: null })
-      return { run, resumed: true }
-    }
+  }
+  if (latest && RESUMABLE.includes(latest.status)) {
+    await store.updateRun(latest._id, { status: 'interrupted', abortReason: latest.abortReason || 'superseded by a newer pass' })
   }
   const run = {
     _id: newRunId(now),
     mode: 'live',
     gmcEnv: o.gmcEnv || null,
+    slot: o.slot ?? null,
+    trigger: o.trigger || null,
+    requestedBy: o.requestedBy || null,
     status: 'running',
     holder,
     startedAt: now,
@@ -281,7 +300,7 @@ async function handleDeletes (ctx, completeness) {
     return report
   }
   if (o.deletes !== 'enabled') {
-    report.blockedReason = 'deletes are in report mode (PRICE_SYNC_DELETES=report)'
+    report.blockedReason = 'deletes are in report mode'
     return report
   }
 
@@ -308,7 +327,8 @@ async function handleDeletes (ctx, completeness) {
  * deps: { store, productInputs, fetchPage(after) => page, logger, now() => Date,
  *         deadlineMs (absolute epoch ms, optional), retry (googleWrites options) }
  * opts: see DEFAULTS, plus accountId, dataSource, contentLanguage, feedLabel,
- *       expectedCurrency, gmcEnv, force, maxPages, maxWrites.
+ *       expectedCurrency, gmcEnv, force, maxPages, maxWrites, and slot / trigger /
+ *       requestedBy (see startOrResume).
  */
 async function runPriceSync (deps, opts) {
   const o = cfg(opts)
@@ -456,6 +476,8 @@ async function runPriceSync (deps, opts) {
     return {
       runId: run._id,
       mode: o.mode,
+      slot: run.slot ?? o.slot ?? null,
+      trigger: run.trigger ?? o.trigger ?? null,
       status,
       resumed,
       abortReason: unfinishedReason,
@@ -517,4 +539,4 @@ function formatPriceSyncDigest (summary, { env } = {}) {
   return lines.join('\n')
 }
 
-module.exports = { runPriceSync, formatPriceSyncDigest, alertsFor, passCompleteness, DEFAULTS }
+module.exports = { runPriceSync, formatPriceSyncDigest, alertsFor, passCompleteness, DEFAULTS, RESUMABLE }

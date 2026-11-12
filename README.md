@@ -16,6 +16,8 @@ Sections **§4 (corrections)** and **§15 (security)** are non-negotiable.
 | `diagnostics` | web (`require-adobe-auth: true`) | Returns detailed `product_view` status and item issues for processed products owned by the configured data source. Optional `offerIds` narrows the report. Posts a digest to Slack + log. |
 | `bootstrap-datasource` | admin (`web: no`) | One-off per environment. Creates a primary API data source and prints its ID. Store the ID in `.env` as `GMC_DATASOURCE_ID_{TEST\|PROD}`. |
 | `price-sync` | scheduled (`web: no`) | Daily pass over Zazzle's `getbulkpricing`; patches changed price / sale / availability (and optionally shipping) onto existing offers. See [Daily price sync](#daily-price-sync-price-sync). |
+| `price-sync-scheduler` | trigger, every 15 min (`web: no`) | Starts `price-sync` at the times set in the admin app and resumes passes that were cut short. |
+| `admin-api` | web (IMS user token, checked in `lib/adminAuth.js`) | Backend for the [admin app](#admin-app): runs, health, CSV exports, settings, Run now. |
 
 Package name in the manifest: `gmc-feed-sync`. Runtime: `nodejs:22`. All web
 actions are marked `final: true` so injected secrets cannot be overridden by
@@ -162,9 +164,19 @@ bulk pricing endpoint (`getbulkpricing`, 100 products per call, ~520 calls per
 pass). DA documents are not touched: they carry no prices, and the PDP reads
 prices live from Zazzle.
 
-**Schedule.** An alarm trigger fires at 08:15 and 10:15 UTC
-(`price-sync-daily` in `app.config.yaml`). 08:15 runs the pass; 10:15 only
-resumes a pass that didn't finish, and is a no-op otherwise.
+**Schedule.** Set in the [admin app](#admin-app): 1–4 times a day in Pacific
+time, default 12:15 AM (just after promos change over at midnight Pacific;
+Zazzle asks for one pass daily shortly after 07:00 UTC). The `price-sync-tick`
+alarm fires `price-sync-scheduler` every 15 minutes; when a scheduled time has
+come, it claims that time slot in `price_sync_slots` (so it starts once) and
+invokes `price-sync` non-blocking with `slot` and `trigger=schedule`. Each slot
+is its own pass: invoking the same slot again resumes or skips it, a new slot
+starts over (marking an unfinished older pass `interrupted`). If `price-sync`
+fails before it creates the slot's run (e.g. the database was unavailable),
+the scheduler invokes it again 10 minutes later, up to 3 attempts. A pass cut short
+(`aborted`, or `running` with no progress for 35 minutes) is resumed by the
+scheduler, at most hourly and 3 times. Nothing starts while a run holds the
+lock, while scheduled runs are paused, or with `PRICE_SYNC_MODE=off`.
 
 **What a pass does.**
 1. Pages through `getbulkpricing`. A failing call is retried on the same
@@ -205,6 +217,11 @@ prices from `getbulkpricing`.
 | `PRICE_SYNC_MODE` | `off` (default), `dry-run`, `live` | `live` | `off` |
 | `PRICE_SYNC_DELETES` | `report` (default), `enabled` | `report` | `report` |
 | `PRICE_SYNC_SHIPPING` | `ignore` (default), `send` | `send` | `send` |
+| `PRICE_SYNC_EDITORS` | comma-separated emails (GitHub environment variable `vars.PRICE_SYNC_EDITORS`) | `maxn@adobe.com` | `maxn@adobe.com` |
+
+`PRICE_SYNC_MODE` is the ceiling: the admin app can't turn on writes.
+`PRICE_SYNC_DELETES` and `PRICE_SYNC_SHIPPING` are defaults until someone
+picks a value in the admin app's Settings.
 
 With `PRICE_SYNC_SHIPPING=send`, each offer's `shipping` is written from
 Zazzle's list (empty list → cleared so account shipping settings apply; null
@@ -233,8 +250,9 @@ aio runtime activation list --limit 10      # recent runs, with duration and sta
 # rehearse against live Zazzle from your machine (no credentials, writes nothing)
 node scripts/price-sync-dry-run.js --pages 5
 ```
-`force` starts a new pass even if one already completed today. A pass stopped
-by `maxPages` is resumed by the next invocation.
+Without `slot`, an invocation resumes or skips a pass started in the last 20
+hours; `force` starts a new pass anyway. A pass stopped by `maxPages` is
+resumed by the next invocation. CLI runs ignore the admin app's pause.
 
 `reason: locked` means another invocation is running, or one crashed without
 releasing the lock; the response's `lockHeldUntil` says when it frees up (at
@@ -245,6 +263,51 @@ aio app db document find price_sync_locks '{}'
 aio app db document delete price_sync_locks '{"_id": "price-sync"}'
 ```
 
+### Admin app
+
+A web UI for people who don't use the CLI: the **Runs** tab shows the latest
+run, the next scheduled run, health (offers close to expiry, failing
+repeatedly, missing from Merchant Center), run history with per-run details,
+and CSV downloads of the missing / failing / near-expiry offers and of a run's
+delete candidates. The **Settings** tab sets the schedule, pause, deletes,
+shipping, the refresh window, a per-run write cap and how often missing
+offers are rechecked, with a change history, and has **Run now**.
+
+Open it through Experience Cloud so it gets your Adobe sign-in:
+- Stage: <https://experience.adobe.com/?devMode=true#/custom-apps/?localDevUrl=https://14257-pdpgmcsync-stage.adobeio-static.net/index.html>
+- Production: the same with the production workspace's static host
+  (`https://<prod namespace>.adobeio-static.net/index.html`).
+
+`devMode=true` works without any approval. Listing it in the Experience
+Cloud app switcher needs an org admin to approve a published app.
+
+**Access.** The browser sends the user's IMS token; `admin-api` asks IMS for
+the profile (which validates the token) and allows anyone with an
+`@adobe.com` email to view (hard-coded in `lib/adminAuth.js`), and only emails in `PRICE_SYNC_EDITORS` to save
+settings or start a run. To add an editor, edit the `PRICE_SYNC_EDITORS`
+variable in the repo's **stage** / **production** environment settings and
+redeploy (push to `main` for stage, a release for prod).
+
+**Settings** live in `price_sync_settings` (one doc, versioned so two
+editors can't overwrite each other) with every change in
+`price_sync_settings_history`. A run reads them when it starts. Saved
+settings that no longer validate fall back to the defaults, with a warning on
+the Runs tab.
+
+| Setting | Default | Rule |
+| --- | --- | --- |
+| Run times (Pacific) | 12:15 AM | 1–4, quarter hours, ≥2 h apart |
+| Paused | off | scheduled runs only; Run now still works |
+| Deletes | deploy default | report / enabled |
+| Shipping | deploy default | send / ignore |
+| Resend unchanged after / spread over (days) | 20 / 6 | sum ≤ 26 (Google expires offers at 30) |
+| Most updates per run | no limit | over-limit offers go next run |
+| Recheck missing offers every (days) | 7 | 1–30 |
+
+**Local UI development.** `aio app run` serves `web-src` on localhost; outside
+Experience Cloud there's no IMS token, so point it at a deployed workspace
+and open it through the `devMode` URL with `localDevUrl=https://localhost:9080`.
+
 ### Monitoring
 
 Each invocation logs, for example:
@@ -253,9 +316,12 @@ PRICE_SYNC_RESULT env=test status=complete mode=live run=2026-11-11T08:15:00.412
 PRICE_SYNC_ALERT env=test run=... :: Pass aborted: zazzle after=2560...: HTTP 503
 ```
 `status` is `complete`, `incomplete` (finished but Zazzle skipped products,
-so no deletes), `aborted` (stopped on an error; the next trigger resumes it),
-`stopped` (manual `maxPages`), `skipped` (already ran today / locked) or
-`failed` (couldn't start).
+so no deletes), `aborted` (stopped on an error; the scheduler resumes it),
+`stopped` (manual `maxPages`), `skipped` (already ran / locked / paused) or
+`failed` (couldn't start). Run docs also show `interrupted` (replaced by a
+newer pass). `trigger=` is `schedule`, `manual` (Run now) or `cli`. The
+scheduler logs a `PRICE_SYNC_SCHEDULER` line only when it starts or resumes a
+run.
 
 Where to look:
 - **Logs:** [Adobe Developer Console](https://developer.adobe.com/console) →
@@ -351,6 +417,12 @@ Deploys and pushes are performed by the repo owner — not by this tooling.
   `disable-download: true` on production actions once stable (one-way).
 - Bearer tokens are extracted from the request header and validated with IMS.
   Invalid tokens return `401`; an IMS outage fails closed with `503`.
+- `admin-api` (the admin app's backend) is `require-adobe-auth: false` +
+  `final: true` and checks callers itself: the user's IMS token must return
+  a profile from IMS (`401` otherwise), viewing needs an `@adobe.com` email
+  (`403` otherwise) and changes need an email in `PRICE_SYNC_EDITORS`. If IMS
+  can't be reached it fails closed with `502`. Settings changes and Run now
+  are logged with the editor's email.
 - Incoming rows are allowlist-validated in [`validate.js`](./actions/lib/validate.js).
   Chunks are capped at 100 products, sized against measured per-chunk latency
   to stay well under the 60s blocking web-action timeout (payload size isn't
@@ -367,7 +439,9 @@ actions/
   sync-products/index.js
   diagnostics/index.js
   bootstrap-datasource/index.js
-  price-sync/index.js               # scheduled daily Zazzle → GMC price pass
+  price-sync/index.js               # daily Zazzle → GMC price pass
+  price-sync-scheduler/index.js     # 15-minute tick: starts/resumes price-sync per the admin settings
+  admin-api/index.js                # web backend for the admin app
   utils.js                          # scaffold helpers (errorResponse, checkMissingRequestInputs, ...)
   lib/
     auth.js                         # validates service-account JSON and constructs GoogleAuth
@@ -386,10 +460,15 @@ actions/
     priceMapping.js                 # Zazzle product → price state, diffing, patch requests
     priceStore.js                   # App Builder Database store (last-sent records, runs, lock)
     priceSync.js                    # pass orchestration: resume, writes, deletes, digest
+    priceSyncSettings.js            # admin settings: defaults, validation, Pacific-time schedule
+    priceSyncScheduler.js           # scheduler tick: claim due slot, resume cut-short passes
+    adminApi.js / adminAuth.js      # admin app operations and IMS-profile access check
+    runtimeInvoke.js                # non-blocking action invoke via the Runtime REST API
     googleWrites.js                 # productInputs.patch/delete with backoff
 config/
   defaults.json                     # brand, availability, condition, currency, feedLabel, contentLanguage, pdpBaseUrl (TODO)
   category-map.json                 # product_type → googleProductCategory (empty by default)
+web-src/                          # admin app (React Spectrum): Runs + Settings tabs
 test/
   unit/                             # 100 tests; no network
   integration/                      # env-gated, test account only

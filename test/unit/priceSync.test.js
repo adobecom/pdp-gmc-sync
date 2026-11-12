@@ -124,6 +124,23 @@ describe('runPriceSync', () => {
     expect(await h.run(zazzle([product(1)]), google(), { force: true })).toMatchObject({ status: 'complete' })
   })
 
+  test('with slots, each slot is its own pass: the same slot resumes or skips, a new one starts over', async () => {
+    const h = harness()
+    const products = [1, 2, 3].map(n => product(n))
+    const cut = await h.run(zazzle(products, { failAt: '1002', failTimes: 1 }), google(), { slot: 's1', trigger: 'schedule' })
+    expect(cut).toMatchObject({ status: 'aborted', slot: 's1', trigger: 'schedule' })
+    h.advance(60 * 1000)
+    expect(await h.run(zazzle(products), google(), { slot: 's1' })).toMatchObject({ status: 'complete', resumed: true, runId: cut.runId })
+    expect(await h.run(zazzle(products), google(), { slot: 's1' })).toMatchObject({ skipped: true, reason: 'already-ran' })
+
+    const cut2 = await h.run(zazzle(products, { failAt: '1002', failTimes: 1 }), google(), { slot: 's2' })
+    expect(cut2.status).toBe('aborted')
+    const fresh = await h.run(zazzle(products), google(), { slot: 's3', trigger: 'manual', requestedBy: 'ed@adobe.com' })
+    expect(fresh).toMatchObject({ status: 'complete', resumed: false })
+    expect(h.store.runs.get(cut2.runId).status).toBe('interrupted')
+    expect(h.store.runs.get(fresh.runId)).toMatchObject({ slot: 's3', trigger: 'manual', requestedBy: 'ed@adobe.com' })
+  })
+
   test('skips when another invocation holds the lock, saying who and until when', async () => {
     const h = harness()
     await h.store.acquireLock('someone-else', T0, 60000)
